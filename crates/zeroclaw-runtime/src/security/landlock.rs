@@ -78,7 +78,8 @@ impl LandlockSandbox {
                     | AccessFs::MakeSock
                     | AccessFs::MakeFifo
                     | AccessFs::MakeBlock
-                    | AccessFs::MakeSym,
+                    | AccessFs::MakeSym
+                    | AccessFs::Refer,
             )
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -103,7 +104,8 @@ impl LandlockSandbox {
                         | AccessFs::MakeReg
                         | AccessFs::MakeSock
                         | AccessFs::MakeFifo
-                        | AccessFs::MakeSym,
+                        | AccessFs::MakeSym
+                        | AccessFs::Refer,
                 ))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
@@ -116,7 +118,18 @@ impl LandlockSandbox {
             // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
             (
                 "/tmp",
-                AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile,
+                AccessFs::WriteFile
+                    | AccessFs::ReadFile
+                    | AccessFs::Truncate
+                    | AccessFs::ReadDir
+                    | AccessFs::RemoveDir
+                    | AccessFs::RemoveFile
+                    | AccessFs::MakeDir
+                    | AccessFs::MakeSock
+                    | AccessFs::MakeFifo
+                    | AccessFs::MakeReg
+                    | AccessFs::MakeSym
+                    | AccessFs::Refer,
                 true,
             ),
             // Linux dynamic linker (ld-linux-yourarch.so.version) which designed to run on FHS 3.0
@@ -159,6 +172,27 @@ impl LandlockSandbox {
             ),
             // some variant of sh requires access to /dev/null
             ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+            // some shell scripts require access to /dev/urandom / /dev/random.
+            ("/dev/urandom", AccessFs::ReadFile.into(), false),
+            ("/dev/random", AccessFs::ReadFile.into(), false),
+            // Let basic commandline tools which access the internet to access the network
+            // configuration such as resolve.conf, hosts
+            ("/etc/resolv.conf", AccessFs::ReadFile.into(), false),
+            ("/etc/hosts", AccessFs::ReadFile.into(), false),
+            // Let applications know what timezone is it. symlink will lead to
+            // /usr/share/zoneinfo/...
+            ("/etc/localtime", AccessFs::ReadFile.into(), false),
+            // Let git read global config
+            ("/etc/gitconfig", AccessFs::ReadFile.into(), false),
+            // Let applications access ssl certificates / system crypto configuration
+            (
+                "/etc/crypto-policies",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            ("/etc/pki", AccessFs::ReadFile | AccessFs::ReadDir, false),
+            ("/etc/ssl", AccessFs::ReadFile | AccessFs::ReadDir, false),
+            ("/etc/system-fips", AccessFs::ReadFile | AccessFs::ReadDir, false),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
