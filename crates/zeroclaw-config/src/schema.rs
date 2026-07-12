@@ -4132,6 +4132,9 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub acp_enable_mcp: bool,
+    #[tab(Bundles)]
+    #[serde(default)]
+    pub acp_enable_memory: bool,
     /// Cron job aliases. Each entry references `cron[key]`, a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
@@ -4279,6 +4282,7 @@ impl Default for AliasedAgentConfig {
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
             acp_enable_mcp: false,
+            acp_enable_memory: false,
             cron_jobs: Vec::new(),
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
