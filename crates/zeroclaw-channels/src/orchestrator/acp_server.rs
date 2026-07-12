@@ -237,6 +237,7 @@ impl AcpServer {
         agent_alias: &str,
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
+        exclude_memory: bool,
     ) -> Result<Agent> {
         if let ConfigSource::Live(live_config) = &self.config_source {
             Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
@@ -244,7 +245,7 @@ impl AcpServer {
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
-                true,
+                exclude_memory,
                 // ACP turns transport the typed file attachment `deliver_file` emits.
                 true,
                 self.sop_engine.clone(),
@@ -258,7 +259,7 @@ impl AcpServer {
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
-                true,
+                exclude_memory,
                 // ACP turns transport the typed file attachment `deliver_file` emits.
                 true,
                 self.sop_engine.clone(),
@@ -791,12 +792,16 @@ impl AcpServer {
         // by default to keep `session/new` prompt; on to load this agent's
         // `mcp_bundles` tools. Runs without the sessions lock held (see above).
         let enable_mcp = config.agent(&agent_alias).is_some_and(|a| a.acp_enable_mcp);
+        let disable_memory = !config
+            .agent(&agent_alias)
+            .is_some_and(|a| a.acp_enable_memory);
         let mut agent = match self
             .build_agent(
                 &config,
                 &agent_alias,
                 std::path::Path::new(&workspace_dir),
                 enable_mcp,
+                disable_memory,
             )
             .await
         {
@@ -1047,8 +1052,17 @@ impl AcpServer {
         let enable_mcp = config
             .agent(&restore_alias)
             .is_some_and(|a| a.acp_enable_mcp);
+        let disable_memory = !config
+            .agent(&restore_alias)
+            .is_some_and(|a| a.acp_enable_memory);
         let agent_result = self
-            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .build_agent(
+                &config,
+                &restore_alias,
+                &workspace_dir,
+                enable_mcp,
+                disable_memory,
+            )
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
@@ -1262,8 +1276,17 @@ impl AcpServer {
         let enable_mcp = config
             .agent(&restore_alias)
             .is_some_and(|a| a.acp_enable_mcp);
+        let disable_memory = !config
+            .agent(&restore_alias)
+            .is_some_and(|a| a.acp_enable_memory);
         let agent_result = self
-            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .build_agent(
+                &config,
+                &restore_alias,
+                &workspace_dir,
+                enable_mcp,
+                disable_memory,
+            )
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
@@ -3454,6 +3477,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_acp_enable_memory_defaults_off() {
+        assert!(
+            !zeroclaw_config::schema::AliasedAgentConfig::default().acp_enable_memory,
+            "Memory must stay opt-in per agent so session/new is prompt by default (#8193)"
+        );
+    }
+
     #[tokio::test]
     async fn session_new_skips_mcp_by_default() {
         let cwd = tempfile::tempdir().unwrap();
@@ -3507,6 +3538,43 @@ mod tests {
                 std::str::from_utf8(&r.body)
                     .map(|b| b.contains("tools/list"))
                     .unwrap_or(false)
+            }),
+            "agent with acp_enable_mcp must list tools from granted MCP servers; \
+             got {} request(s)",
+            requests.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_loads_memory_when_agent_opts_in() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = start_mock_mcp_http_server("records.list").await;
+        let mut config = make_mcp_granting_test_config(cwd.path(), server.uri());
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .acp_enable_memory = true;
+        let acp = AcpServer::new(config, AcpServerConfig::default());
+
+        acp.handle_session_new(&serde_json::json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "agentAlias": "test-agent"
+        }))
+        .await
+        .expect("session/new must succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            requests.iter().any(|r| {
+                let body = std::str::from_utf8(&r.body)
+                    .map(|b| b.contains("tools/list"))
+                    .unwrap_or(false);
+                println!("{:?}", body);
+                body
             }),
             "agent with acp_enable_mcp must list tools from granted MCP servers; \
              got {} request(s)",
