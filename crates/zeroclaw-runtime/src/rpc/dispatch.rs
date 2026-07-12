@@ -1097,8 +1097,13 @@ impl RpcDispatcher {
             .chat_mode
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
-            || req.exclude_memory == Some(true);
+        let exclude_memory = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            !config
+                .agent(&req.agent_alias)
+                .is_some_and(|a| a.acp_enable_memory)
+        } else {
+            req.exclude_memory == Some(true)
+        };
         // Chat sessions initialize MCP so the TUI sees the same MCP tools the
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
@@ -1566,7 +1571,12 @@ impl RpcDispatcher {
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
-        let exclude_memory = true;
+        let exclude_memory = !self
+            .ctx
+            .config
+            .read()
+            .agent(&data.agent_alias)
+            .is_some_and(|a| a.acp_enable_memory);
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
         let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
@@ -7297,7 +7307,9 @@ mod tests {
     async fn acp_chat_mode_strips_memory_tools_without_exclude_flag() {
         // The server must derive memory exclusion from `chat_mode: acp`, not
         // trust the wire `exclude_memory` flag. A Code session that omits the
-        // flag entirely must still come up with no memory tools.
+        // flag entirely must still come up with no memory tools — UNLESS the
+        // agent has `acp_enable_memory = true`.  This test uses the default
+        // config where `acp_enable_memory` is `false`, so memory is stripped.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -7365,6 +7377,111 @@ mod tests {
         assert!(
             has_any_memory_tool,
             "non-ACP session MUST expose at least one memory tool — tool list: {tool_names:?}"
+        );
+    }
+
+    /// When `acp_enable_memory = true` is set on the agent config, an ACP
+    /// (Code) session created via `session/new` with `chat_mode: "acp"` must
+    /// retain the long-term-memory tools — matching the AcpServer WebSocket
+    /// path.  This is the positive counterpart to
+    /// `acp_chat_mode_strips_memory_tools_without_exclude_flag`.
+    #[tokio::test]
+    async fn acp_session_new_keeps_memory_tools_when_acp_enable_memory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+
+        // Override the test agent to opt in to memory for ACP sessions.
+        let config = {
+            let mut config = config;
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent must exist in config")
+                .acp_enable_memory = true;
+            config
+        };
+
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-enable-memory-001"
+        });
+
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-enable-memory-001")
+            .await
+            .expect("session must be registered in the store after session/new");
+
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+
+        let has_any_memory_tool = MEMORY_TOOLS.iter().any(|&t| tool_names.contains(&t));
+        assert!(
+            has_any_memory_tool,
+            "ACP session with acp_enable_memory=true MUST expose at least one memory tool \
+             — tool list: {tool_names:?}"
+        );
+    }
+
+    /// When `acp_enable_memory = true`, a reaped ACP session that rehydrates
+    /// must come back WITH the memory tools — the positive counterpart to
+    /// `reaped_acp_session_rehydrates_without_memory_tools`.
+    #[tokio::test]
+    async fn reaped_acp_session_rehydrates_with_memory_tools_when_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+
+        // Override the test agent to opt in to memory for ACP sessions.
+        let config = {
+            let mut config = config;
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent must exist in config")
+                .acp_enable_memory = true;
+            config
+        };
+
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-reaped-mem-enabled-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        // Reap the in-memory session, leaving the durable row to rehydrate from.
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("a reaped ACP session must rehydrate to a working agent");
+
+        let agent = recovered.lock().await;
+        let tool_names = agent.tool_names();
+        let has_any_memory_tool = MEMORY_TOOLS.iter().any(|&t| tool_names.contains(&t));
+        assert!(
+            has_any_memory_tool,
+            "rehydrated ACP session with acp_enable_memory=true MUST expose at least one \
+             memory tool — tool list: {tool_names:?}"
         );
     }
 
