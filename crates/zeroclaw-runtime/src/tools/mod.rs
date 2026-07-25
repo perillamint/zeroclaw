@@ -589,7 +589,7 @@ pub fn all_tools_with_runtime(
     let register_coding_cli_tools = has_shell_access && persistent_writes;
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, security.as_ref());
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
