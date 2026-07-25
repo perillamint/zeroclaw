@@ -19,6 +19,12 @@ use crate::security::traits::Sandbox;
 #[derive(Debug)]
 pub struct LandlockSandbox {
     workspace_dir: Option<std::path::PathBuf>,
+    /// SecurityPolicy.allowed_roots, full rw
+    allowed_roots: Vec<std::path::PathBuf>,
+    /// SecurityPolicy.allowed_roots_read_only, ro
+    allowed_roots_read_only: Vec<std::path::PathBuf>,
+    /// SecurityPolicy.allowed_roots_write_only, wo
+    allowed_roots_write_only: Vec<std::path::PathBuf>,
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
@@ -29,6 +35,7 @@ impl LandlockSandbox {
     }
 
     /// Create a Landlock sandbox with a specific workspace directory
+    /// and allowed_roots
     pub fn with_workspace(workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
         // Test if Landlock is available by trying to create a minimal ruleset
         let test_ruleset = Ruleset::default()
@@ -36,7 +43,12 @@ impl LandlockSandbox {
             .and_then(|ruleset| ruleset.create());
 
         match test_ruleset {
-            Ok(_) => Ok(Self { workspace_dir }),
+            Ok(_) => Ok(Self {
+                workspace_dir,
+                allowed_roots: Vec::new(),
+                allowed_roots_read_only: Vec::new(),
+                allowed_roots_write_only: Vec::new(),
+            }),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -50,6 +62,15 @@ impl LandlockSandbox {
                 ))
             }
         }
+    }
+
+    /// Create a Landlock sandbox from a `SecurityPolicy`.
+    pub fn with_policy(policy: &zeroclaw_config::policy::SecurityPolicy) -> std::io::Result<Self> {
+        let mut sandbox = Self::with_workspace(Some(policy.workspace_dir.clone()))?;
+        sandbox.allowed_roots = policy.allowed_roots.clone();
+        sandbox.allowed_roots_read_only = policy.allowed_roots_read_only.clone();
+        sandbox.allowed_roots_write_only = policy.allowed_roots_write_only.clone();
+        Ok(sandbox)
     }
 
     /// Probe if Landlock is available (for auto-detection)
@@ -79,7 +100,8 @@ impl LandlockSandbox {
                     | AccessFs::MakeFifo
                     | AccessFs::MakeBlock
                     | AccessFs::MakeSym
-                    | AccessFs::Refer,
+                    | AccessFs::Refer
+                    | AccessFs::IoctlDev,
             )
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -87,12 +109,13 @@ impl LandlockSandbox {
         // Allow workspace directory (read/write/execute).
         // If a workspace was supplied but doesn't exist, fail closed rather than
         // silently applying restrictions without a rule for it.
-        if let Some(ref workspace) = self.workspace_dir {
-            let workspace_fd =
-                PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    workspace_fd,
+        for (allow_path, perm) in self
+            .workspace_dir
+            .iter()
+            .chain(self.allowed_roots.iter())
+            .map(|dir| {
+                (
+                    dir,
                     AccessFs::Execute
                         | AccessFs::WriteFile
                         | AccessFs::ReadFile
@@ -105,9 +128,55 @@ impl LandlockSandbox {
                         | AccessFs::MakeSock
                         | AccessFs::MakeFifo
                         | AccessFs::MakeSym
+                        | AccessFs::Refer
+                        | AccessFs::IoctlDev,
+                )
+            })
+            .chain(
+                self.allowed_roots_read_only
+                    .iter()
+                    .map(|dir| (dir, AccessFs::ReadFile | AccessFs::ReadDir)),
+            )
+            .chain(self.allowed_roots_write_only.iter().map(|dir| {
+                (
+                    dir,
+                    AccessFs::WriteFile
+                        | AccessFs::RemoveDir
+                        | AccessFs::RemoveFile
+                        | AccessFs::MakeDir
+                        | AccessFs::MakeReg
+                        | AccessFs::MakeSym
                         | AccessFs::Refer,
-                ))
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                )
+            }))
+        {
+            match PathFd::new(allow_path) {
+                Ok(path_fd) => {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(path_fd, perm))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Err(PathFdError::OpenCall { source, .. }) => {
+                    if source.kind() == std::io::ErrorKind::NotFound {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            format!(
+                                "Failed to create PathFd for a nonexistent path {:?}.",
+                                allow_path,
+                            ),
+                        );
+                    } else {
+                        Err(std::io::Error::other(source.to_string()))?;
+                    }
+                }
+                Err(e) => {
+                    Err(std::io::Error::other(e.to_string()))?;
+                }
+            }
         }
 
         // Allow paths for general operations.
@@ -193,6 +262,7 @@ impl LandlockSandbox {
             ("/etc/pki", AccessFs::ReadFile | AccessFs::ReadDir, false),
             ("/etc/ssl", AccessFs::ReadFile | AccessFs::ReadDir, false),
             ("/etc/system-fips", AccessFs::ReadFile | AccessFs::ReadDir, false),
+            ("/etc/uv", AccessFs::ReadFile | AccessFs::ReadDir, false),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
