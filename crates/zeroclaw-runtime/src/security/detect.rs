@@ -3,6 +3,7 @@
 use crate::security::traits::Sandbox;
 use std::path::Path;
 use std::sync::Arc;
+use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
@@ -237,7 +238,7 @@ fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
     runtime_kind: &str,
-    workspace_dir: Option<&Path>,
+    policy: &SecurityPolicy,
 ) -> Arc<dyn Sandbox> {
     let backend = &sandbox.backend;
 
@@ -247,12 +248,11 @@ pub fn create_sandbox(
     }
 
     match backend {
-        SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir)
-        }
+        SandboxBackend::Auto | SandboxBackend::None => detect_best_sandbox(runtime_kind, policy),
         requested => {
-            let selected = configured_backend_selection(requested, runtime_kind, workspace_dir);
-            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
+            let selected =
+                configured_backend_selection(requested, runtime_kind, Some(&policy.workspace_dir));
+            if let Some(sandbox) = create_selected_sandbox(selected, policy) {
                 return sandbox;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
@@ -261,9 +261,9 @@ pub fn create_sandbox(
     }
 }
 
-fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
-    let selected = detect_best_backend(runtime_kind, workspace_dir);
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
+fn detect_best_sandbox(runtime_kind: &str, policy: &SecurityPolicy) -> Arc<dyn Sandbox> {
+    let selected = detect_best_backend(runtime_kind, Some(&policy.workspace_dir));
+    if let Some(sandbox) = create_selected_sandbox(selected, policy) {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -274,18 +274,17 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
 
 fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
-    workspace_dir: Option<&Path>,
+    policy: &SecurityPolicy,
 ) -> Option<Arc<dyn Sandbox>> {
+    let workspace_dir: Option<&Path> = Some(&policy.workspace_dir);
     match selected {
         SelectedSandboxBackend::None => None,
         SelectedSandboxBackend::Landlock => {
             #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
             {
-                super::landlock::LandlockSandbox::with_workspace(
-                    workspace_dir.map(Path::to_path_buf),
-                )
-                .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                .ok()
+                super::landlock::LandlockSandbox::with_policy(policy)
+                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
+                    .ok()
             }
             #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
             {
@@ -466,7 +465,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("", None);
+        let sandbox = detect_best_sandbox("", &SecurityPolicy::default());
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -478,7 +477,7 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "", &SecurityPolicy::default());
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -502,7 +501,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "", &SecurityPolicy::default());
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -512,7 +511,7 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native", None);
+        let sandbox = detect_best_sandbox("native", &SecurityPolicy::default());
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -534,7 +533,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "native", &SecurityPolicy::default());
         let posture = sandbox_posture(&sandbox_cfg, "native", None);
 
         assert_eq!(posture.active_backend, sandbox.name());
@@ -549,7 +548,7 @@ mod tests {
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "native", &SecurityPolicy::default());
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         assert!(sandbox.is_available());
     }
