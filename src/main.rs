@@ -688,7 +688,8 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
-  zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
+  zeroclaw acp --max-sessions 5       # limit concurrent sessions
+  zeroclaw acp --agent zeroclaw       # use 'zeroclaw' as the default agent")]
     Acp {
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
@@ -697,6 +698,12 @@ Examples:
         /// Session inactivity timeout in seconds (default: 3600)
         #[arg(long)]
         session_timeout: Option<u64>,
+
+        /// Agent alias to use as the default for new sessions when the
+        /// `session/new` request omits `agentAlias`. Must match a
+        /// configured `[agents.<alias>]` entry.
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -3852,6 +3859,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Acp {
             max_sessions,
             session_timeout,
+            agent,
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
@@ -3882,17 +3890,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         })
                         .ok();
                 let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
+                    std::sync::Arc::new(
+                        channels::acp_server::AcpServer::new_with_store(
+                            config, acp_config, store,
+                        )
+                        .with_connection_default_agent(agent.clone()),
+                    )
                 } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
+                    std::sync::Arc::new(
+                        channels::acp_server::AcpServer::new(config, acp_config)
+                            .with_connection_default_agent(agent.clone()),
+                    )
                 };
                 server.run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (max_sessions, session_timeout, agent);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
