@@ -688,7 +688,9 @@ Methods: initialize, session/new, session/prompt, session/stop.
 Examples:
   zeroclaw acp                        # start ACP server
   zeroclaw acp --max-sessions 5       # limit concurrent sessions
-  zeroclaw acp --agent zeroclaw       # use 'zeroclaw' as the default agent")]
+  zeroclaw acp --agent zeroclaw       # use 'zeroclaw' as the default agent
+  zeroclaw acp --model claude-sonnet-4-6
+  zeroclaw acp -p openrouter --model anthropic/claude-sonnet-4-6")]
     Acp {
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
@@ -703,6 +705,21 @@ Examples:
         /// configured `[agents.<alias>]` entry.
         #[arg(long)]
         agent: Option<String>,
+
+        /// Model provider to use (openrouter, anthropic, openai, ollama, …).
+        /// Accepts `type.alias` (e.g. `anthropic.fast`) or a bare `type`
+        /// (uses the agent's existing alias). When given, all agents are
+        /// repointed to this provider entry. Combined with `--model`,
+        /// creates/overrides the entry's model in one shot.
+        #[arg(short = 'p', long = "model-provider", alias = "provider")]
+        model_provider: Option<String>,
+
+        /// Override the model used for sessions. When used alone (without
+        /// `--model-provider`), overrides the `model` on every agent's
+        /// existing model_provider entry. When combined with
+        /// `--model-provider`, sets the model on the target provider entry.
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -3823,6 +3840,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
             max_sessions,
             session_timeout,
             agent,
+            model_provider,
+            model,
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
@@ -3836,6 +3855,50 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 if let Some(timeout) = session_timeout {
                     acp_config.session_timeout_secs = timeout;
                 }
+
+                // Apply model / model-provider overrides before building the
+                // server. The config is moved into the server constructor, so
+                // mutating it here propagates the override to every session
+                // the server creates.
+                if let Some(mp_override) = &model_provider {
+                    // Parse "type.alias" or bare "type" (uses "default" as alias).
+                    let (type_key, alias_key) =
+                        mp_override.split_once('.').unwrap_or((mp_override.as_str(), "default"));
+                    let entry = config.providers.models.ensure(type_key, alias_key).ok_or_else(|| {
+                        anyhow::Error::msg(format!(
+                            "Unknown model_provider family: {type_key}. \
+                             Configure a provider via `zeroclaw quickstart` or the /config editor."
+                        ))
+                    })?;
+                    if let Some(m) = &model {
+                        entry.model = Some(m.clone());
+                    }
+                    // Repoint every agent to the override provider so that
+                    // sessions created with any `agentAlias` pick it up.
+                    for agent_cfg in config.agents.values_mut() {
+                        agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+                    }
+                } else if let Some(model_override) = &model {
+                    // Override the model on every agent's existing
+                    // model_provider entry. Agents without a configured
+                    // provider are skipped (they will fail at session/new
+                    // as usual).
+                    for agent_alias in config.agents.keys().cloned().collect::<Vec<_>>() {
+                        let mp_ref = config
+                            .agents
+                            .get(&agent_alias)
+                            .and_then(|a| a.model_provider.split_once('.'))
+                            .map(|(t, a)| (t.to_string(), a.to_string()));
+                        if let Some((type_key, alias_key)) = mp_ref {
+                            if let Some(entry) =
+                                config.providers.models.ensure(&type_key, &alias_key)
+                            {
+                                entry.model = Some(model_override.clone());
+                            }
+                        }
+                    }
+                }
+
                 let store =
                     zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
                         .map(std::sync::Arc::new)
@@ -3869,7 +3932,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout, agent);
+                let _ = (max_sessions, session_timeout, agent, model_provider, model);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
@@ -9192,6 +9255,51 @@ mod tests {
                 ..
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn acp_command_parses_model_override() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "acp",
+            "--model",
+            "claude-sonnet-4-6",
+        ])
+        .expect("acp --model should parse");
+
+        match cli.command {
+            Commands::Acp { model, .. } => {
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+            }
+            other => panic!("expected acp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn acp_command_parses_model_provider_and_model() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "acp",
+            "-p",
+            "anthropic",
+            "--model",
+            "claude-opus-4-7",
+        ])
+        .expect("acp --model-provider --model should parse");
+
+        match cli.command {
+            Commands::Acp {
+                model_provider,
+                model,
+                ..
+            } => {
+                assert_eq!(model_provider.as_deref(), Some("anthropic"));
+                assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
+            }
+            other => panic!("expected acp command, got {other:?}"),
         }
     }
 
