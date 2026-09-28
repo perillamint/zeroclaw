@@ -52,6 +52,7 @@ fn handled_access() -> BitFlags<AccessFs> {
         | AccessFs::MakeFifo
         | AccessFs::MakeBlock
         | AccessFs::MakeSym
+        | AccessFs::Refer
 }
 
 /// Rights granted to a read-write root: the primary workspace and every entry
@@ -70,6 +71,7 @@ fn read_write_access() -> BitFlags<AccessFs> {
         | AccessFs::MakeSock
         | AccessFs::MakeFifo
         | AccessFs::MakeSym
+        | AccessFs::Refer
 }
 
 /// Rights granted to `SecurityPolicy::allowed_roots_read_only`.
@@ -90,6 +92,7 @@ fn write_only_access() -> BitFlags<AccessFs> {
         | AccessFs::MakeSock
         | AccessFs::MakeFifo
         | AccessFs::MakeSym
+        | AccessFs::Refer
 }
 
 /// The static, workspace-independent rules every sandboxed child receives.
@@ -101,13 +104,13 @@ fn write_only_access() -> BitFlags<AccessFs> {
 /// actually installed come from one list: a rule added here that the check
 /// never saw would silently reintroduce the tier bypass it exists to catch.
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
-fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 23] {
+fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 30] {
     [
         // /tmp: general temp directory for child processes (pipes, sockets, temp files).
         // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
         (
             "/tmp",
-            AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile,
+            read_write_access(),
             true,
         ),
         // Linux dynamic linker (ld-linux-yourarch.so.version) which designed to run on FHS 3.0
@@ -233,6 +236,22 @@ fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 23] {
             AccessFs::ReadFile | AccessFs::ReadDir,
             false,
         ),
+        ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+        // some shell scripts require access to /dev/urandom / /dev/random.
+        ("/dev/urandom", AccessFs::ReadFile.into(), false),
+        ("/dev/random", AccessFs::ReadFile.into(), false),
+        // Let applications know what timezone is it. symlink will lead to
+        // /usr/share/zoneinfo/...
+        ("/etc/localtime", AccessFs::ReadFile.into(), false),
+        // Let git read global config
+        ("/etc/gitconfig", AccessFs::ReadFile.into(), false),
+        // Let applications access ssl certificates / system crypto configuration
+        (
+            "/etc/crypto-policies",
+            AccessFs::ReadFile | AccessFs::ReadDir,
+            false,
+        ),
+        ("/etc/system-fips", AccessFs::ReadFile | AccessFs::ReadDir, false),
     ]
 }
 
