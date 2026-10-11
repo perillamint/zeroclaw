@@ -125,6 +125,20 @@ enum ConfigSource {
     Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
+/// Connection-scoped model override carried by `--model`/`--model-provider`
+/// (standalone `zeroclaw acp`) or `?model=`/`?modelProvider=` (the gateway
+/// WebSocket endpoint). Applied to the owned `session/new` config snapshot
+/// for the resolved agent only: a provider override repoints that agent's
+/// `model_provider` reference (creating the entry when the family is known),
+/// and a bare model override replaces the model on the agent's existing
+/// provider entry. Restore paths ignore it and it never mutates the live
+/// config shared with other connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionModelOverride {
+    model_provider: Option<String>,
+    model: Option<String>,
+}
+
 pub struct AcpServer {
     /// The sole authority for `Config`-backed settings. Managed stdio and
     /// gateway ACP resolve their shared authority's config.
@@ -167,6 +181,12 @@ pub struct AcpServer {
     /// and `[acp].default_agent`. Not a config change: it only supplies the
     /// default for new sessions (restore keeps the operator-controlled chain).
     connection_default_agent: Option<String>,
+    /// Connection-scoped model override (`--model`/`--model-provider` on
+    /// standalone ACP, `?model=`/`?modelProvider=` on the gateway endpoint).
+    /// Applied to an owned snapshot of the config at `session/new` for the
+    /// resolved agent only; restore paths ignore it, and it never mutates
+    /// the live config shared with other connections.
+    connection_model_override: Option<ConnectionModelOverride>,
     client_elicitation_caps: std::sync::RwLock<ElicitationCapabilities>,
 }
 
@@ -311,6 +331,7 @@ impl AcpServer {
             sop_engine: None,
             sop_audit: None,
             connection_default_agent: None,
+            connection_model_override: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
     }
@@ -337,6 +358,7 @@ impl AcpServer {
         *current = capabilities;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_agent(
         &self,
         config: &Config,
@@ -344,9 +366,29 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
         exclude_memory: bool,
+        connection_override_applied: bool,
     ) -> Result<Agent> {
+        // When a connection-scoped model override was applied to `config` by
+        // the caller, the live-config constructors would re-snapshot the
+        // shared live config and silently drop the override. Overridden
+        // sessions therefore always build from the caller's snapshot, which
+        // pins their whole config view for the session lifetime — the same
+        // semantics a standalone `zeroclaw acp` process has.
+        let live_config = match &self.config_source {
+            ConfigSource::Live(live_config) if !connection_override_applied => Some(live_config),
+            _ => None,
+        };
         let Some(store) = self.store.as_ref() else {
-            return if let ConfigSource::Live(live_config) = &self.config_source {
+            let execution_capability = match &self.config_source {
+                ConfigSource::Live(live_config) => {
+                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                        live_config.clone(),
+                        self.agent_lifecycle.clone(),
+                    ))
+                }
+                ConfigSource::Standalone(_) => None,
+            };
+            return if let Some(live_config) = live_config {
                 Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
                     live_config.clone(),
                     agent_alias,
@@ -357,14 +399,11 @@ impl AcpServer {
                     self.sop_engine.clone(),
                     self.sop_audit.clone(),
                     self.canvas_store.clone(),
-                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                        live_config.clone(),
-                        self.agent_lifecycle.clone(),
-                    )),
+                    execution_capability,
                 )
                 .await
             } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel(
+                Agent::from_config_with_session_cwd_and_mcp_backchannel_with_capability(
                     config,
                     agent_alias,
                     Some(workspace_dir),
@@ -374,11 +413,12 @@ impl AcpServer {
                     self.sop_engine.clone(),
                     self.sop_audit.clone(),
                     self.canvas_store.clone(),
+                    execution_capability,
                 )
                 .await
             };
         };
-        if let ConfigSource::Live(live_config) = &self.config_source {
+        if let Some(live_config) = live_config {
             let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
                 live_config.clone(),
                 self.agent_lifecycle.clone(),
@@ -428,6 +468,146 @@ impl AcpServer {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         self
+    }
+
+    /// Set the connection-scoped model override (`--model` /
+    /// `--model-provider` for standalone ACP, `?model=` / `?modelProvider=`
+    /// on the gateway endpoint). Blank values are treated as absent. The
+    /// override applies to `session/new` for the resolved agent only — it
+    /// never mutates the live config shared with other connections, and
+    /// restore paths ignore it. Sessions created under an override pin their
+    /// config view for their lifetime (standalone semantics), so a
+    /// live-config refresh cannot silently drop the override mid-session.
+    pub fn with_connection_model_overrides(
+        mut self,
+        model_provider: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        let model_provider = model_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let model = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if model_provider.is_some() || model.is_some() {
+            self.connection_model_override = Some(ConnectionModelOverride {
+                model_provider,
+                model,
+            });
+        }
+        self
+    }
+
+    /// Validate a `--model-provider` override value against a config
+    /// snapshot. Accepts `type.alias` or a bare `type` (which resolves to the
+    /// `default` alias); both segments must be non-empty and the family must
+    /// name a configured provider slot. Shared by the gateway's connect-time
+    /// pre-flight, the standalone launch check, and `session/new` override
+    /// application so the surfaces cannot drift.
+    pub fn validate_model_provider_override(
+        config: &Config,
+        model_provider: &str,
+    ) -> Result<(), String> {
+        let (type_key, _alias_key) = Self::parse_model_provider_override(model_provider)?;
+        if !config
+            .providers
+            .models
+            .contains_model_provider_type(type_key)
+        {
+            return Err(Self::unknown_model_provider_family_error(type_key));
+        }
+        Ok(())
+    }
+
+    /// Parse a `--model-provider` override value into its trimmed
+    /// `(type, alias)` pair. A bare `type` resolves to the `default` alias.
+    fn parse_model_provider_override(model_provider: &str) -> Result<(&str, &str), String> {
+        let (type_key, alias_key) = model_provider
+            .split_once('.')
+            .unwrap_or((model_provider, "default"));
+        let (type_key, alias_key) = (type_key.trim(), alias_key.trim());
+        if type_key.is_empty() || alias_key.is_empty() {
+            return Err(format!(
+                "Malformed model_provider override `{model_provider}` — expected \
+                 `<type>.<alias>` (e.g. `anthropic.fast`) or a bare `<type>`"
+            ));
+        }
+        Ok((type_key, alias_key))
+    }
+
+    fn unknown_model_provider_family_error(family: &str) -> String {
+        format!(
+            "Unknown model_provider family: {family}. Configure a provider via \
+             `zeroclaw quickstart` or the /config editor."
+        )
+    }
+
+    /// Apply a connection model override to an owned config snapshot for one
+    /// agent, mirroring the `zeroclaw` chat command's override semantics.
+    fn apply_connection_model_override(
+        config: &mut Config,
+        agent_alias: &str,
+        overrides: &ConnectionModelOverride,
+    ) -> Result<(), String> {
+        if let Some(mp_override) = overrides.model_provider.as_deref() {
+            Self::validate_model_provider_override(config, mp_override)?;
+            let (type_key, alias_key) = Self::parse_model_provider_override(mp_override)?;
+            // `ensure` cannot fail for a family `validate` admitted, but keep
+            // the error path rather than unwrap: the two checks are separate
+            // table walks.
+            let entry = config
+                .providers
+                .models
+                .ensure(type_key, alias_key)
+                .ok_or_else(|| Self::unknown_model_provider_family_error(type_key))?;
+            if let Some(m) = overrides.model.as_deref() {
+                entry.model = Some(m.to_string());
+            }
+            // Repoint only the resolved agent: the override is
+            // connection-scoped, not a config change.
+            if let Some(agent_cfg) = config.agents.get_mut(agent_alias) {
+                agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+            }
+        } else if let Some(model_override) = overrides.model.as_deref() {
+            // Override the model on the agent's existing provider entry.
+            // Agents without a parseable provider reference are skipped
+            // (they fail agent construction as usual).
+            if let Some(agent_cfg) = config.agents.get(agent_alias)
+                && let Some((fam, ali)) = agent_cfg.model_provider.split_once('.')
+                && let Some(entry) = config.providers.models.ensure(fam, ali)
+            {
+                entry.model = Some(model_override.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply [`Self::connection_model_override`] to an owned snapshot for one
+    /// agent. Returns whether an override was applied, so `build_agent` can
+    /// pin the session to the snapshot (the live constructors re-snapshot
+    /// the shared config and would drop the override).
+    fn apply_override_to_snapshot(
+        &self,
+        config: &mut Config,
+        agent_alias: &str,
+    ) -> Result<bool, RpcError> {
+        match &self.connection_model_override {
+            None => Ok(false),
+            Some(overrides) => {
+                Self::apply_connection_model_override(config, agent_alias, overrides).map_err(
+                    |message| RpcError {
+                        code: INVALID_PARAMS,
+                        message,
+                        data: None,
+                    },
+                )?;
+                Ok(true)
+            }
+        }
     }
 
     /// Attach the shared gateway [`CanvasStore`] so that agents created by
@@ -710,18 +890,29 @@ impl AcpServer {
         // Advertise the model a new session on this connection would use by
         // default — the default session agent's model — falling back to the
         // install-wide first configured model when no default agent can be
-        // inferred (e.g. agent-less onboarding configs).
+        // inferred (e.g. agent-less onboarding configs). A connection model
+        // override changes what that session would use, so apply it to the
+        // advertised snapshot too; application is best-effort here (a family
+        // unknown in the current live view surfaces as a `session/new`
+        // error instead).
         let default_model = match self.default_session_agent_alias(&config) {
-            Some(alias) => Self::alias_if_dispatchable(&config, &alias)
-                .and_then(|alias| config.resolved_model_provider_for_agent(&alias))
-                .and_then(|(_, _, entry)| {
-                    entry
-                        .model
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|model| !model.is_empty())
-                        .map(ToString::to_string)
-                }),
+            Some(alias) => Self::alias_if_dispatchable(&config, &alias).and_then(|alias| {
+                let mut advertised = config.clone();
+                if let Some(overrides) = &self.connection_model_override {
+                    let _ =
+                        Self::apply_connection_model_override(&mut advertised, &alias, overrides);
+                }
+                advertised
+                    .resolved_model_provider_for_agent(&alias)
+                    .and_then(|(_, _, entry)| {
+                        entry
+                            .model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|model| !model.is_empty())
+                            .map(ToString::to_string)
+                    })
+            }),
             None => config.resolve_default_model(),
         };
 
@@ -869,7 +1060,7 @@ impl AcpServer {
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
-        let config = self.config_snapshot();
+        let mut config = self.config_snapshot();
 
         // Every ACP session is bound to an explicit agent alias.
         // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
@@ -897,6 +1088,13 @@ impl AcpServer {
                 data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
+        // Apply the connection-scoped model override (if any) to this owned
+        // snapshot before anything else reads model state from it: the agent
+        // build, the session record, and the created log line below all see
+        // the override. Only `session/new` applies it — restore paths keep
+        // the persisted session's provider.
+        let connection_override_applied =
+            self.apply_override_to_snapshot(&mut config, &agent_alias)?;
         let admission = self
             .agent_lifecycle
             .reserve_admission(agent_alias.clone())
@@ -994,6 +1192,7 @@ impl AcpServer {
                 std::path::Path::new(&workspace_dir),
                 enable_mcp,
                 disable_memory,
+                connection_override_applied,
             )
             .await
         {
@@ -1292,6 +1491,9 @@ impl AcpServer {
                 &workspace_dir,
                 enable_mcp,
                 disable_memory,
+                // Restore paths never apply the connection model override:
+                // transport input cannot rebind persisted session ownership.
+                false,
             )
             .await
             .map_err(|e| RpcError {
@@ -1635,6 +1837,9 @@ impl AcpServer {
                 &workspace_dir,
                 enable_mcp,
                 disable_memory,
+                // Restore paths never apply the connection model override:
+                // transport input cannot rebind persisted session ownership.
+                false,
             )
             .await
             .map_err(|e| RpcError {
@@ -5190,6 +5395,240 @@ mod tests {
         let session = sessions.get(session_id).expect("session must exist");
         let session = session.lock().await;
         session.agent_alias.clone()
+    }
+
+    async fn session_model(server: &AcpServer, session_id: &str) -> (String, String) {
+        let sessions = server.sessions.lock().await;
+        let session = sessions.get(session_id).expect("session must exist");
+        let session = session.lock().await;
+        (session.model_provider.clone(), session.model.clone())
+    }
+
+    /// `make_test_config` plus a second provider family, for exercising
+    /// connection model overrides that repoint an agent across families.
+    fn dual_family_config(cwd: &std::path::Path) -> Config {
+        let mut cfg = make_test_config(cwd);
+        cfg.providers.models.openrouter.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("openrouter-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg
+    }
+
+    #[tokio::test]
+    async fn session_new_applies_connection_model_override_to_resolved_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_model_overrides(None, Some("claude-sonnet-4-6".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-alpha",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("session/new should apply the connection model override");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        let (model_provider, model) = session_model(&server, session_id).await;
+        assert_eq!(model_provider, "anthropic.default");
+        assert_eq!(model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn session_new_model_provider_override_repoints_resolved_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        // A bare family must resolve to the `default` alias and repoint the
+        // agent across families.
+        let server = AcpServer::new(dual_family_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_model_overrides(Some("openrouter".to_string()), None);
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("bare family override should resolve to the default alias");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        let (model_provider, model) = session_model(&server, session_id).await;
+        assert_eq!(model_provider, "openrouter.default");
+        assert_eq!(model, "openrouter-model");
+    }
+
+    #[tokio::test]
+    async fn session_new_model_provider_override_creates_missing_alias_entry() {
+        let cwd = tempfile::tempdir().unwrap();
+        // `anthropic.fast` does not exist in the config; combined with
+        // `--model` the override must create it and set its model in one shot.
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_model_overrides(
+                Some("anthropic.fast".to_string()),
+                Some("claude-opus-4-7".to_string()),
+            );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-beta",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("session/new should repoint the agent at the override provider");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        let (model_provider, model) = session_model(&server, session_id).await;
+        assert_eq!(model_provider, "anthropic.fast");
+        assert_eq!(model, "claude-opus-4-7");
+    }
+
+    #[tokio::test]
+    async fn session_new_model_only_override_skips_agent_without_parseable_provider() {
+        // This test drives the agent-init-failure log path, which the
+        // attribution test captures by message: hold the log test locks so
+        // the two tests cannot interleave their broadcast records.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let cwd = tempfile::tempdir().unwrap();
+        // An agent whose provider reference has no `<type>.<alias>` split is
+        // skipped by the model-only override (the standalone `--model`
+        // semantics) and then fails construction with the ordinary error.
+        let mut config = two_agent_config(cwd.path());
+        config.agents.get_mut("agent-beta").unwrap().model_provider = "bare-no-dot".into();
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_model_overrides(None, Some("claude-sonnet-4-6".to_string()))
+            .with_connection_default_agent(Some("agent-beta".to_string()));
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("an agent with an unparseable provider ref must fail as usual");
+
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message.contains("does not resolve to a configured"),
+            "expected ordinary provider error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_unknown_model_provider_family_errors() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(two_agent_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_model_overrides(Some("bogus.family".to_string()), None);
+
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "agent-alpha",
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect_err("an unknown provider family must fail session/new");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("Unknown model_provider family"),
+            "expected unknown-family error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn live_config_session_new_applies_connection_model_override() {
+        let cwd = tempfile::tempdir().unwrap();
+        // Gateway connections resolve through a live config handle; the
+        // override must survive that path (the session pins the overridden
+        // snapshot instead of re-snapshotting the live config).
+        let live = zeroclaw_config::live::LiveConfig::new(make_test_config(cwd.path()));
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = AcpServer::new_with_live_config_and_writer(
+            live.handle(),
+            Default::default(),
+            AcpServerConfig::default(),
+            writer_tx,
+        )
+        .with_connection_model_overrides(None, Some("claude-sonnet-4-6".to_string()));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            }))
+            .await
+            .expect("session/new on a live-config server should honor the override");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        let (_, model) = session_model(&server, session_id).await;
+        assert_eq!(model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_connection_model_override() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(make_test_config(cwd.path()), AcpServerConfig::default())
+            .with_connection_model_overrides(None, Some("claude-sonnet-4-6".to_string()));
+
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+
+        assert_eq!(
+            result["_meta"]["zeroclaw"]["defaultModel"].as_str(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_restore_ignores_connection_model_override() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-restore-ignores-model-override";
+        store
+            .create_session(
+                session_id,
+                "agent-alpha",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
+            .unwrap();
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = AcpServer::new_with_writer_and_store(
+            two_agent_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_connection_model_overrides(
+            Some("openrouter.alt".to_string()),
+            Some("other-model".to_string()),
+        );
+
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        // Transport input cannot rebind persisted session ownership: the
+        // override must not apply to restores.
+        let (model_provider, model) = session_model(&server, session_id).await;
+        assert_eq!(model_provider, "anthropic.default");
+        assert_eq!(model, "claude-haiku-4-5");
     }
 
     #[tokio::test]
