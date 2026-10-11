@@ -1255,9 +1255,10 @@ Examples:
 
         /// Model provider to use (openrouter, anthropic, openai, ollama, …).
         /// Accepts `type.alias` (e.g. `anthropic.fast`) or a bare `type`
-        /// (uses the agent's existing alias). When given, all agents are
-        /// repointed to this provider entry. Combined with `--model`,
-        /// creates/overrides the entry's model in one shot.
+        /// (uses the `default` alias). When given, the resolved agent is
+        /// repointed to this provider entry for sessions on this process.
+        /// Combined with `--model`, creates/overrides the entry's model in
+        /// one shot.
         #[arg(short = 'p', long = "model-provider", alias = "provider")]
         model_provider: Option<String>,
 
@@ -10229,47 +10230,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     acp_config.session_timeout_secs = timeout;
                 }
 
-                // Apply model / model-provider overrides before building the
-                // server. The config is moved into the server constructor, so
-                // mutating it here propagates the override to every session
-                // the server creates.
-                if let Some(mp_override) = &model_provider {
-                    // Parse "type.alias" or bare "type" (uses "default" as alias).
-                    let (type_key, alias_key) =
-                        mp_override.split_once('.').unwrap_or((mp_override.as_str(), "default"));
-                    let entry = config.providers.models.ensure(type_key, alias_key).ok_or_else(|| {
-                        anyhow::Error::msg(format!(
-                            "Unknown model_provider family: {type_key}. \
-                             Configure a provider via `zeroclaw quickstart` or the /config editor."
-                        ))
-                    })?;
-                    if let Some(m) = &model {
-                        entry.model = Some(m.clone());
-                    }
-                    // Repoint every agent to the override provider so that
-                    // sessions created with any `agentAlias` pick it up.
-                    for agent_cfg in config.agents.values_mut() {
-                        agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
-                    }
-                } else if let Some(model_override) = &model {
-                    // Override the model on every agent's existing
-                    // model_provider entry. Agents without a configured
-                    // provider are skipped (they will fail at session/new
-                    // as usual).
-                    for agent_alias in config.agents.keys().cloned().collect::<Vec<_>>() {
-                        let mp_ref = config
-                            .agents
-                            .get(&agent_alias)
-                            .and_then(|a| a.model_provider.split_once('.'))
-                            .map(|(t, a)| (t.to_string(), a.to_string()));
-                        if let Some((type_key, alias_key)) = mp_ref {
-                            if let Some(entry) =
-                                config.providers.models.ensure(&type_key, &alias_key)
-                            {
-                                entry.model = Some(model_override.clone());
-                            }
-                        }
-                    }
+                // Fail fast on an unknown model provider family: the server
+                // applies the override per `session/new` (so it cannot be
+                // dropped by a live-config refresh), but a family that is
+                // unknown at startup is a launch error, matching the
+                // pre-authority behavior.
+                if let Some(model_provider) = model_provider.as_deref() {
+                    channels::acp_server::AcpServer::validate_model_provider_override(
+                        &config,
+                        model_provider,
+                    )
+                    .map_err(anyhow::Error::msg)?;
                 }
 
                 let store =
@@ -10291,7 +10262,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let server = channels::acp_server::AcpServer::new_stdio_with_authority(
                     &authority, acp_config, store,
                 )
-                .with_connection_default_agent(agent);
+                .with_connection_default_agent(agent)
+                .with_connection_model_overrides(model_provider, model);
                 std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
@@ -19739,13 +19711,8 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn acp_command_parses_model_override() {
-        let cli = Cli::try_parse_from([
-            "zeroclaw",
-            "acp",
-            "--model",
-            "claude-sonnet-4-6",
-        ])
-        .expect("acp --model should parse");
+        let cli = Cli::try_parse_from(["zeroclaw", "acp", "--model", "claude-sonnet-4-6"])
+            .expect("acp --model should parse");
 
         match cli.command {
             Commands::Acp { model, .. } => {

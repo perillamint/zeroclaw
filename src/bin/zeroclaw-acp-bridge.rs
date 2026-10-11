@@ -105,8 +105,24 @@ async fn load_acp_bridge_target() -> Result<BridgeTarget> {
     let config: BridgeConfig = toml::from_str(contents)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
+    // Connection-scoped model overrides ride the WebSocket URL as query
+    // params; the gateway applies them to `session/new` on that connection.
+    let model_provider = flag_value_from_args(
+        args.iter().cloned(),
+        &["--model-provider", "--provider", "-p"],
+        "provider",
+    )?;
+    let model = flag_value_from_args(args.iter().cloned(), &["--model"], "model")?;
+    let query = acp_model_query(model_provider.as_deref(), model.as_deref());
+
     let pair_code = pair_code_from_args(args)?.or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));
-    resolve_acp_bridge_target(&config.gateway, &config_dir, pair_code.as_deref()).await
+    resolve_acp_bridge_target(
+        &config.gateway,
+        &config_dir,
+        pair_code.as_deref(),
+        query.as_deref(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -115,25 +131,26 @@ fn acp_bridge_target(config: &BridgeGatewayConfig) -> Result<BridgeTarget> {
         anyhow::bail!(PAIRING_TOKEN_NOT_FOUND_ERROR);
     }
 
-    Ok(bridge_target(config, None))
+    Ok(bridge_target(config, None, None))
 }
 
 async fn resolve_acp_bridge_target(
     config: &BridgeGatewayConfig,
     config_dir: &Path,
     pair_code: Option<&str>,
+    query: Option<&str>,
 ) -> Result<BridgeTarget> {
     if !config.require_pairing {
-        return Ok(bridge_target(config, None));
+        return Ok(bridge_target(config, None, query));
     }
 
     if let Some(token) = token_from_env() {
-        return Ok(bridge_target(config, Some(token)));
+        return Ok(bridge_target(config, Some(token), query));
     }
 
     let cache_path = cached_token_path(config_dir);
     if let Some(token) = read_cached_token(&cache_path).await? {
-        return Ok(bridge_target(config, Some(token)));
+        return Ok(bridge_target(config, Some(token), query));
     }
 
     let pair_code = if let Some(code) = pair_code.map(str::trim).filter(|code| !code.is_empty()) {
@@ -149,16 +166,21 @@ async fn resolve_acp_bridge_target(
     let token = exchange_pairing_code(&pair_url(config), &pair_code).await?;
     write_cached_token(&cache_path, &token).await?;
 
-    Ok(bridge_target(config, Some(token)))
+    Ok(bridge_target(config, Some(token), query))
 }
 
-fn bridge_target(config: &BridgeGatewayConfig, token: Option<String>) -> BridgeTarget {
+fn bridge_target(
+    config: &BridgeGatewayConfig,
+    token: Option<String>,
+    query: Option<&str>,
+) -> BridgeTarget {
     BridgeTarget {
         url: acp_websocket_url(
             config.gateway_scheme(),
             config.host.trim(),
             config.port,
             config.path_prefix.as_deref(),
+            query,
         ),
         token,
     }
@@ -189,48 +211,43 @@ where
         .filter(|value| !value.is_empty())
 }
 
-fn config_dir_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
+/// Read the value of the first occurrence of any of `flags` from CLI args.
+/// Accepts both `--flag value` and `--flag=value` forms. `kind` names the
+/// expected value in the missing-argument error.
+fn flag_value_from_args(
+    args: impl IntoIterator<Item = String>,
+    flags: &[&str],
+    kind: &str,
+) -> Result<Option<String>> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--config-dir" {
-            let dir = args.next().ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "acp-bridge args rejected: --config-dir missing value"
-                );
-                anyhow::Error::msg("--config-dir requires a path value")
-            })?;
-            return Ok(Some(dir));
-        }
-        if let Some(dir) = arg.strip_prefix("--config-dir=") {
-            return Ok(Some(dir.to_string()));
+        for flag in flags {
+            if arg == *flag {
+                let value = args.next().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &format!("acp-bridge args rejected: {flag} missing value")
+                    );
+                    anyhow::Error::msg(format!("{flag} requires a {kind} value"))
+                })?;
+                return Ok(Some(value));
+            }
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                return Ok(Some(value.to_string()));
+            }
         }
     }
     Ok(None)
 }
 
+fn config_dir_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
+    flag_value_from_args(args, &["--config-dir"], "path")
+}
+
 fn pair_code_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--pair-code" {
-            let code = args.next().ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "acp-bridge args rejected: --pair-code missing value"
-                );
-                anyhow::Error::msg("--pair-code requires a code value")
-            })?;
-            return Ok(Some(code));
-        }
-        if let Some(code) = arg.strip_prefix("--pair-code=") {
-            return Ok(Some(code.to_string()));
-        }
-    }
-    Ok(None)
+    flag_value_from_args(args, &["--pair-code"], "code")
 }
 
 fn cached_token_path(config_dir: &Path) -> PathBuf {
@@ -370,10 +387,53 @@ async fn exchange_pairing_code(url: &str, code: &str) -> Result<String> {
     Ok(token)
 }
 
-fn acp_websocket_url(scheme: &str, host: &str, port: u16, path_prefix: Option<&str>) -> String {
+fn acp_websocket_url(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    query: Option<&str>,
+) -> String {
     let host = bracket_host(host);
     let path_prefix = path_prefix.unwrap_or_default().trim_end_matches('/');
-    format!("{scheme}://{host}:{port}{path_prefix}/acp")
+    let query = query
+        .filter(|query| !query.is_empty())
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    format!("{scheme}://{host}:{port}{path_prefix}/acp{query}")
+}
+
+/// Build the `?modelProvider=…&model=…` query that carries connection model
+/// overrides to the gateway ACP endpoint. Returns `None` when neither
+/// override is set.
+fn acp_model_query(model_provider: Option<&str>, model: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(provider) = model_provider {
+        parts.push(format!(
+            "modelProvider={}",
+            percent_encode_query_value(provider)
+        ));
+    }
+    if let Some(model) = model {
+        parts.push(format!("model={}", percent_encode_query_value(model)));
+    }
+    (!parts.is_empty()).then(|| parts.join("&"))
+}
+
+/// Percent-encode a query value per RFC 3986: unreserved characters pass
+/// through, everything else (including `/`, `&`, `=`, `#`, and non-ASCII
+/// bytes) is `%HH`-escaped so it cannot split or terminate the query.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn bracket_host(host: &str) -> String {
@@ -473,10 +533,10 @@ where
 mod tests {
     use super::{
         BridgeGatewayConfig, BridgeGatewayTlsConfig, CONFIG_NOT_FOUND_ERROR,
-        PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_websocket_url, cached_token_path,
-        config_dir_from_args, exchange_pairing_code, fetch_pairing_code, http_gateway_url,
-        pair_code_from_args, read_cached_token, token_from_env_with, write_cached_token,
-        write_frame,
+        PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_model_query, acp_websocket_url,
+        cached_token_path, config_dir_from_args, exchange_pairing_code, fetch_pairing_code,
+        flag_value_from_args, http_gateway_url, pair_code_from_args, percent_encode_query_value,
+        read_cached_token, token_from_env_with, write_cached_token, write_frame,
     };
 
     #[tokio::test]
@@ -493,7 +553,7 @@ mod tests {
     #[test]
     fn acp_websocket_url_uses_config_host_and_port() {
         assert_eq!(
-            acp_websocket_url("ws", "192.0.2.10", 49152, None),
+            acp_websocket_url("ws", "192.0.2.10", 49152, None, None),
             "ws://192.0.2.10:49152/acp"
         );
     }
@@ -501,7 +561,7 @@ mod tests {
     #[test]
     fn acp_websocket_url_brackets_ipv6_hosts() {
         assert_eq!(
-            acp_websocket_url("ws", "::1", 42617, None),
+            acp_websocket_url("ws", "::1", 42617, None, None),
             "ws://[::1]:42617/acp"
         );
     }
@@ -509,7 +569,7 @@ mod tests {
     #[test]
     fn acp_websocket_url_includes_path_prefix() {
         assert_eq!(
-            acp_websocket_url("ws", "127.0.0.1", 42617, Some("/zeroclaw")),
+            acp_websocket_url("ws", "127.0.0.1", 42617, Some("/zeroclaw"), None),
             "ws://127.0.0.1:42617/zeroclaw/acp"
         );
     }
@@ -517,9 +577,108 @@ mod tests {
     #[test]
     fn acp_websocket_url_uses_wss_for_tls_gateway() {
         assert_eq!(
-            acp_websocket_url("wss", "127.0.0.1", 42617, None),
+            acp_websocket_url("wss", "127.0.0.1", 42617, None, None),
             "wss://127.0.0.1:42617/acp"
         );
+    }
+
+    #[test]
+    fn acp_websocket_url_appends_model_override_query() {
+        assert_eq!(
+            acp_websocket_url(
+                "ws",
+                "127.0.0.1",
+                42617,
+                Some("/zeroclaw"),
+                Some("modelProvider=openrouter&model=anthropic%2Fclaude-sonnet-4-6")
+            ),
+            "ws://127.0.0.1:42617/zeroclaw/acp?modelProvider=openrouter&model=anthropic%2Fclaude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn acp_model_query_combines_provider_and_model() {
+        assert_eq!(
+            acp_model_query(Some("openrouter"), Some("anthropic/claude-sonnet-4-6")).as_deref(),
+            Some("modelProvider=openrouter&model=anthropic%2Fclaude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn acp_model_query_supports_model_only_and_none() {
+        assert_eq!(
+            acp_model_query(None, Some("claude-sonnet-4-6")).as_deref(),
+            Some("model=claude-sonnet-4-6")
+        );
+        assert_eq!(acp_model_query(None, None), None);
+    }
+
+    #[test]
+    fn percent_encode_query_value_escapes_reserved_characters() {
+        assert_eq!(
+            percent_encode_query_value("a b&c=d#e/f+g"),
+            "a%20b%26c%3Dd%23e%2Ff%2Bg"
+        );
+        assert_eq!(
+            percent_encode_query_value("anthropic.fast"),
+            "anthropic.fast"
+        );
+        assert_eq!(percent_encode_query_value("클로"), "%ED%81%B4%EB%A1%9C");
+    }
+
+    #[test]
+    fn model_overrides_from_args_support_flag_forms() {
+        assert_eq!(
+            flag_value_from_args(
+                ["--model".to_string(), "claude-sonnet-4-6".to_string()].into_iter(),
+                &["--model"],
+                "model"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            flag_value_from_args(
+                ["--model=claude-sonnet-4-6".to_string()].into_iter(),
+                &["--model"],
+                "model"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn model_provider_from_args_supports_short_and_alias_forms() {
+        for flags in [
+            vec!["--model-provider".to_string(), "openrouter".to_string()],
+            vec!["--model-provider=openrouter".to_string()],
+            vec!["-p".to_string(), "openrouter".to_string()],
+            vec!["-p=openrouter".to_string()],
+            vec!["--provider=openrouter".to_string()],
+        ] {
+            assert_eq!(
+                flag_value_from_args(
+                    flags.into_iter(),
+                    &["--model-provider", "--provider", "-p"],
+                    "provider"
+                )
+                .unwrap()
+                .as_deref(),
+                Some("openrouter"),
+                "every accepted spelling should parse"
+            );
+        }
+    }
+
+    #[test]
+    fn flag_value_from_args_rejects_missing_value() {
+        let error =
+            flag_value_from_args(["--model".to_string()], &["--model"], "model").unwrap_err();
+
+        assert_eq!(error.to_string(), "--model requires a model value");
     }
 
     #[test]

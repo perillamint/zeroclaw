@@ -26,6 +26,17 @@ pub struct AcpQuery {
     /// address each configured agent via its own URL. Validated exactly like
     /// an explicit `agentAlias` at `session/new`; ignored by session restore.
     agent: Option<String>,
+    /// Connection-scoped model override: replaces the model on the resolved
+    /// agent's existing provider entry at `session/new`. Blank is treated as
+    /// absent; restore paths ignore it.
+    model: Option<String>,
+    /// Connection-scoped model provider override (`type.alias` or bare
+    /// `type`, which resolves to the `default` alias): repoints the resolved
+    /// agent at `session/new`. The family is pre-flighted against the live
+    /// config before the upgrade; blank is treated as absent; restore paths
+    /// ignore it. Grants no access beyond configured providers.
+    #[serde(rename = "modelProvider", alias = "model_provider")]
+    model_provider: Option<String>,
 }
 
 pub async fn handle_ws_acp(
@@ -45,6 +56,25 @@ pub async fn handle_ws_acp(
         }
     }
 
+    // Pre-flight the model provider override so an unknown family fails the
+    // connection up front instead of at the first `session/new`. The
+    // `session/new` handler re-validates against its own snapshot, so a
+    // family removed from the live config after connect still errors there.
+    let model_provider = normalize_override(params.model_provider.as_deref());
+    if let Some(provider) = model_provider.as_deref()
+        && let Err(message) =
+            AcpServer::validate_model_provider_override(&state.config.read(), provider)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "rejected ACP WebSocket with invalid model provider override"
+        );
+        return (axum::http::StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let model = normalize_override(params.model.as_deref());
+
     let ws = if headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
@@ -55,11 +85,25 @@ pub async fn handle_ws_acp(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, params.agent))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, params.agent, model_provider, model))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option<String>) {
+/// Trim a query override value; blank is treated as absent.
+fn normalize_override(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    default_agent: Option<String>,
+    model_provider: Option<String>,
+    model: Option<String>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (input_tx, input_rx) = mpsc::channel::<String>(256);
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
@@ -93,7 +137,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
             )
             .with_canvas_store(canvas_store)
             .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
-            .with_connection_default_agent(default_agent),
+            .with_connection_default_agent(default_agent)
+            .with_connection_model_overrides(model_provider, model),
         )
     } else {
         Arc::new(
@@ -105,7 +150,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
             )
             .with_canvas_store(canvas_store)
             .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
-            .with_connection_default_agent(default_agent),
+            .with_connection_default_agent(default_agent)
+            .with_connection_model_overrides(model_provider, model),
         )
     };
 
@@ -225,6 +271,58 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
+    /// Boot the full gateway on an ephemeral port and wait until it accepts
+    /// connections. Returns the shutdown sender and the `host:port` address.
+    /// The caller must hold `crate::PRICING_BINDING_TEST_LOCK` for the whole
+    /// test (`run_gateway` binds the process-global pricing config handle).
+    async fn boot_front_door_gateway(
+        cfg: zeroclaw_config::schema::Config,
+    ) -> (tokio::sync::watch::Sender<bool>, String) {
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+
+        // Reserve an ephemeral port, then hand it to the gateway.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, _reload_rx) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+
+        let _server = zeroclaw_spawn::spawn!(crate::run_gateway(
+            "127.0.0.1",
+            port,
+            cfg,
+            None,
+            Some(reload_controls),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        // Wait until the gateway is accepting TCP connections.
+        let addr = format!("127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections");
+
+        (shutdown_tx, addr)
+    }
+
     /// On-disk-equivalent of the channels-crate `make_test_config`: a fake
     /// `anthropic.default` provider (model name only, no key — agent
     /// construction is offline) and one dispatchable agent `test-agent`, with
@@ -275,53 +373,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path();
         let cfg = front_door_config(install_root);
-        std::fs::create_dir_all(&cfg.data_dir).unwrap();
         let expected_ws = cfg
             .agent_workspace_dir("test-agent")
             .to_string_lossy()
             .into_owned();
 
-        // Reserve an ephemeral port, then hand it to the gateway.
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let (shutdown_tx, addr) = boot_front_door_gateway(cfg).await;
 
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        let (reload_tx, _reload_rx) = tokio::sync::watch::channel(false);
-        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
-            shutdown_tx.clone(),
-            reload_tx,
-        );
-
-        let server = zeroclaw_spawn::spawn!(crate::run_gateway(
-            "127.0.0.1",
-            port,
-            cfg,
-            None,
-            Some(reload_controls),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ));
-
-        // Wait until the gateway is accepting TCP connections.
-        let addr = format!("127.0.0.1:{port}");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("gateway should accept connections");
-
-        let url = format!("ws://127.0.0.1:{port}/acp");
+        let url = format!("ws://{addr}/acp");
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("WebSocket upgrade on /acp should succeed");
@@ -368,13 +427,96 @@ mod tests {
         .expect("session/new response should arrive before timeout");
 
         shutdown_tx.send(true).ok();
-        server.abort();
 
         assert_eq!(
             workspace_dir.as_deref(),
             Some(expected_ws.as_str()),
             "omitted-cwd session/new over the real /acp WebSocket route must \
              return the per-agent workspace, not the daemon CWD"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_ws_front_door_model_override_advertised_in_initialize() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path();
+        let cfg = front_door_config(install_root);
+
+        let (shutdown_tx, addr) = boot_front_door_gateway(cfg).await;
+
+        let url = format!("ws://{addr}/acp?model=claude-opus-4-7");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("WebSocket upgrade with ?model= should succeed");
+
+        ws.send(Message::Text(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        let default_model = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(msg) = ws.next().await {
+                let text = match msg {
+                    Ok(Message::Text(t)) => t.to_string(),
+                    Ok(_) => continue,
+                    Err(e) => panic!("WebSocket read error: {e}"),
+                };
+                let value: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if value.get("id").and_then(|i| i.as_i64()) == Some(1) {
+                    if let Some(err) = value.get("error") {
+                        panic!("initialize returned an error: {err}");
+                    }
+                    return value["result"]["_meta"]["zeroclaw"]["defaultModel"]
+                        .as_str()
+                        .map(String::from);
+                }
+            }
+            None
+        })
+        .await
+        .expect("initialize response should arrive before timeout");
+
+        shutdown_tx.send(true).ok();
+
+        assert_eq!(
+            default_model.as_deref(),
+            Some("claude-opus-4-7"),
+            "the connection model override must be reflected in the advertised default model"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_ws_front_door_rejects_unknown_model_provider_family() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path();
+        let cfg = front_door_config(install_root);
+
+        let (shutdown_tx, addr) = boot_front_door_gateway(cfg).await;
+
+        let url = format!("ws://{addr}/acp?modelProvider=bogus.family");
+        let error = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect_err("an unknown provider family must fail the WebSocket upgrade");
+
+        let status = match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => response.status(),
+            other => panic!("expected an HTTP rejection, got: {other:?}"),
+        };
+
+        shutdown_tx.send(true).ok();
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the unknown-family pre-flight must reject the connection with 400"
         );
     }
 }
