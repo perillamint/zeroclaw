@@ -105,15 +105,22 @@ async fn load_acp_bridge_target() -> Result<BridgeTarget> {
     let config: BridgeConfig = toml::from_str(contents)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
-    // Connection-scoped model overrides ride the WebSocket URL as query
-    // params; the gateway applies them to `session/new` on that connection.
+    // Connection-scoped overrides ride the WebSocket URL as query params;
+    // the gateway uses `agent` as the `session/new` default when the request
+    // omits `agentAlias`, and applies the model overrides to the resolved
+    // agent's provider entry on that connection.
+    let agent = flag_value_from_args(args.iter().cloned(), &["--agent"], "agent alias")?;
     let model_provider = flag_value_from_args(
         args.iter().cloned(),
         &["--model-provider", "--provider", "-p"],
         "provider",
     )?;
     let model = flag_value_from_args(args.iter().cloned(), &["--model"], "model")?;
-    let query = acp_model_query(model_provider.as_deref(), model.as_deref());
+    let query = acp_override_query(
+        agent.as_deref(),
+        model_provider.as_deref(),
+        model.as_deref(),
+    );
 
     let pair_code = pair_code_from_args(args)?.or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));
     resolve_acp_bridge_target(
@@ -403,11 +410,19 @@ fn acp_websocket_url(
     format!("{scheme}://{host}:{port}{path_prefix}/acp{query}")
 }
 
-/// Build the `?modelProvider=…&model=…` query that carries connection model
-/// overrides to the gateway ACP endpoint. Returns `None` when neither
-/// override is set.
-fn acp_model_query(model_provider: Option<&str>, model: Option<&str>) -> Option<String> {
+/// Build the `?agent=…&modelProvider=…&model=…` query that carries
+/// connection-scoped overrides to the gateway ACP endpoint. The `agent`
+/// value is the default agent alias for `session/new` requests that omit
+/// `agentAlias`. Returns `None` when no override is set.
+fn acp_override_query(
+    agent: Option<&str>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(agent) = agent {
+        parts.push(format!("agent={}", percent_encode_query_value(agent)));
+    }
     if let Some(provider) = model_provider {
         parts.push(format!(
             "modelProvider={}",
@@ -533,7 +548,7 @@ where
 mod tests {
     use super::{
         BridgeGatewayConfig, BridgeGatewayTlsConfig, CONFIG_NOT_FOUND_ERROR,
-        PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_model_query, acp_websocket_url,
+        PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_override_query, acp_websocket_url,
         cached_token_path, config_dir_from_args, exchange_pairing_code, fetch_pairing_code,
         flag_value_from_args, http_gateway_url, pair_code_from_args, percent_encode_query_value,
         read_cached_token, token_from_env_with, write_cached_token, write_frame,
@@ -597,20 +612,82 @@ mod tests {
     }
 
     #[test]
-    fn acp_model_query_combines_provider_and_model() {
+    fn acp_websocket_url_appends_agent_override_query() {
         assert_eq!(
-            acp_model_query(Some("openrouter"), Some("anthropic/claude-sonnet-4-6")).as_deref(),
+            acp_websocket_url("ws", "127.0.0.1", 42617, None, Some("agent=fable")),
+            "ws://127.0.0.1:42617/acp?agent=fable"
+        );
+    }
+
+    #[test]
+    fn acp_override_query_combines_provider_and_model() {
+        assert_eq!(
+            acp_override_query(
+                None,
+                Some("openrouter"),
+                Some("anthropic/claude-sonnet-4-6")
+            )
+            .as_deref(),
             Some("modelProvider=openrouter&model=anthropic%2Fclaude-sonnet-4-6")
         );
     }
 
     #[test]
-    fn acp_model_query_supports_model_only_and_none() {
+    fn acp_override_query_includes_agent_alias_and_combines_all_overrides() {
         assert_eq!(
-            acp_model_query(None, Some("claude-sonnet-4-6")).as_deref(),
+            acp_override_query(Some("fable"), None, None).as_deref(),
+            Some("agent=fable")
+        );
+        assert_eq!(
+            acp_override_query(
+                Some("fable"),
+                Some("openrouter"),
+                Some("anthropic/claude-sonnet-4-6")
+            )
+            .as_deref(),
+            Some("agent=fable&modelProvider=openrouter&model=anthropic%2Fclaude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn acp_override_query_percent_encodes_agent_alias() {
+        assert_eq!(
+            acp_override_query(Some("my agent"), None, None).as_deref(),
+            Some("agent=my%20agent")
+        );
+    }
+
+    #[test]
+    fn acp_override_query_supports_model_only_and_none() {
+        assert_eq!(
+            acp_override_query(None, None, Some("claude-sonnet-4-6")).as_deref(),
             Some("model=claude-sonnet-4-6")
         );
-        assert_eq!(acp_model_query(None, None), None);
+        assert_eq!(acp_override_query(None, None, None), None);
+    }
+
+    #[test]
+    fn agent_from_args_supports_flag_forms() {
+        assert_eq!(
+            flag_value_from_args(
+                ["--agent".to_string(), "fable".to_string()].into_iter(),
+                &["--agent"],
+                "agent alias"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("fable")
+        );
+        assert_eq!(
+            flag_value_from_args(
+                ["--agent=fable".to_string()].into_iter(),
+                &["--agent"],
+                "agent alias"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("fable")
+        );
     }
 
     #[test]
