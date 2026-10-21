@@ -74,7 +74,11 @@ pub struct DeferredMcpToolSet {
 impl DeferredMcpToolSet {
     /// Build the set from a connected [`McpRegistry`].
     pub async fn from_registry(registry: Arc<McpRegistry>, security: Arc<SecurityPolicy>) -> Self {
-        let names = registry.tool_names();
+        // Refreshed names: reconcile the registry's index with servers whose
+        // tool list changed after connect (notifications/tools/list_changed)
+        // so stubs reflect the server's *current* toolset, not its
+        // connect-time snapshot.
+        let names = registry.refreshed_tool_names().await;
         let mut stubs = Vec::with_capacity(names.len());
         for name in names {
             if let Some(def) = registry.get_tool_def(&name).await {

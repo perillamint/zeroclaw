@@ -838,9 +838,11 @@ impl ScopedToolRegistry {
                     registry.server_count(),
                 );
                 // Origin set: every `<server>__<tool>` name the registry knows.
-                // Deferred stubs derive from the same `tool_names()` call, so
-                // one extension covers eager, deferred, and later activations.
-                mcp_tool_names.extend(registry.tool_names());
+                // Deferred stubs derive from the same refreshed-name call, so
+                // one extension covers eager, deferred, and later activations
+                // — including tools advertised after connect via
+                // notifications/tools/list_changed.
+                mcp_tool_names.extend(registry.refreshed_tool_names().await);
                 // Elevation arcs exist only to resolve skill-declared MCP
                 // elevation in step 5; skip the collection when no skills are
                 // registered through this assembly.
@@ -1027,7 +1029,9 @@ impl ScopedToolRegistry {
                         tools_registry.push(BuildSlot::Ready(tool_search));
                     }
                 } else {
-                    let names = registry.tool_names();
+                    // Refreshed names so eagerly-registered wrappers include
+                    // tools advertised after connect (list_changed).
+                    let names = registry.refreshed_tool_names().await;
                     let mut registered = 0usize;
                     let mut skipped = 0usize;
                     for name in names {

@@ -61,6 +61,29 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
+/// Inbound JSON-RPC notification (MCP server → client): a `method` with no
+/// `id`, to which no response is expected. Used for server-initiated
+/// notifications such as [`TOOLS_LIST_CHANGED_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// Server-initiated notification that the server's tool list changed and the
+/// client should re-fetch `tools/list` (MCP spec: capabilities → tools).
+pub const TOOLS_LIST_CHANGED_METHOD: &str = "notifications/tools/list_changed";
+
+/// Classify an already-parsed inbound JSON-RPC message: a server→client
+/// notification carries a `method` and no `id`; everything else is handled as
+/// a response to an outstanding request. Kept here so the stdio and SSE
+/// transports apply identical classification.
+pub fn is_server_notification(value: &serde_json::Value) -> bool {
+    value.get("method").is_some() && value.get("id").is_none()
+}
+
 /// JSON-RPC error object embedded in a response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
@@ -226,5 +249,42 @@ mod tests {
         let json = r#"{"tools":[]}"#;
         let result: McpToolsListResult = serde_json::from_str(json).unwrap();
         assert_eq!(result.tools.len(), 0);
+    }
+
+    // ── Server-initiated notifications ──────────────────────────────────────
+
+    #[test]
+    fn notification_deserializes_with_method_and_no_id() {
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+        let notif: JsonRpcNotification = serde_json::from_str(json).unwrap();
+        assert_eq!(notif.method, TOOLS_LIST_CHANGED_METHOD);
+        assert!(notif.params.is_none());
+    }
+
+    #[test]
+    fn notification_params_deserialize() {
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}"#;
+        let notif: JsonRpcNotification = serde_json::from_str(json).unwrap();
+        assert_eq!(notif.method, "notifications/message");
+        assert_eq!(notif.params, Some(serde_json::json!({"level": "info"})));
+    }
+
+    #[test]
+    fn is_server_notification_classifies_messages() {
+        let notification =
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"});
+        assert!(is_server_notification(&notification));
+
+        let response = serde_json::json!({"jsonrpc":"2.0","id":4,"result":{"tools":[]}});
+        assert!(!is_server_notification(&response));
+
+        let error = serde_json::json!({"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}});
+        assert!(!is_server_notification(&error));
+
+        // A request from the server would carry both method and id — not a
+        // notification; routed as a response by the transports.
+        let server_request =
+            serde_json::json!({"jsonrpc":"2.0","id":9,"method":"sampling/createMessage"});
+        assert!(!is_server_notification(&server_request));
     }
 }

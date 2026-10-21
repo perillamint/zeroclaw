@@ -683,7 +683,9 @@ pub async fn collect_mcp_elevation_arcs(
     security: &Arc<zeroclaw_config::policy::SecurityPolicy>,
 ) -> Vec<Arc<dyn Tool>> {
     let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
-    for name in registry.tool_names() {
+    // Refreshed names: a server that advertised new tools after connect
+    // (notifications/tools/list_changed) contributes its current toolset.
+    for name in registry.refreshed_tool_names().await {
         if let Some(def) = registry.get_tool_def(&name).await {
             arcs.push(Arc::new(McpToolWrapper::new(
                 name,
