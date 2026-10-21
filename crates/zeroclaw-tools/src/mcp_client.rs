@@ -10,12 +10,16 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail};
+use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
-use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
+use crate::mcp_protocol::{
+    JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult,
+    TOOLS_LIST_CHANGED_METHOD,
+};
 use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
 use crate::mcp_transport::{
     McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
@@ -36,6 +40,15 @@ const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 /// Maximum automatic reconnect attempts when a request is known not to have
 /// been written. Outcome-unknown requests are never replayed.
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
+
+/// How many times a transport recovery may cascade a tools/list refresh
+/// before the client stops trying (and keeps the connection usable without
+/// a refreshed tool list until the server sends
+/// `notifications/tools/list_changed`). Bounds the recovery → refresh →
+/// outcome-unknown → recovery feedback loop against a server whose
+/// handshakes succeed but whose tools/list responses keep failing; a
+/// successful refresh (from any path) refills the budget.
+const POST_RECOVERY_REFRESH_BUDGET: u64 = 3;
 
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
 /// transport. Shared by the initial [`McpServer::connect`] and the
@@ -163,6 +176,14 @@ struct McpServerInner {
     next_id: AtomicU32,
     tools: Vec<McpToolDef>,
     capabilities: McpServerCapabilities,
+    /// Bumped (under the same lock) every time `tools` is replaced by a
+    /// `tools/list` re-fetch. The registry compares this against the
+    /// generation it last indexed to detect servers whose tool list changed
+    /// after connect (e.g. via `notifications/tools/list_changed`).
+    tools_generation: u64,
+    /// Remaining post-recovery tools/list refresh attempts. See
+    /// [`POST_RECOVERY_REFRESH_BUDGET`]; refilled by any successful refresh.
+    refresh_budget: u64,
 }
 
 // ── Recovery barrier ────────────────────────────────────────────────────────
@@ -382,6 +403,8 @@ impl McpServer {
             next_id: AtomicU32::new(3), // Start at 3 since we used 1 and 2
             tools: tool_list.tools,
             capabilities,
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
 
         ::zeroclaw_log::record!(
@@ -393,13 +416,15 @@ impl McpServer {
             )
         );
 
-        Ok(Self {
+        let server = Self {
             inner: Arc::new(Mutex::new(inner)),
-            transport,
+            transport: Arc::clone(&transport),
             epoch_gate,
             serial_gate,
             recovery: Arc::new(RecoveryBarrier::new()),
-        })
+        };
+        server.spawn_notification_listener(transport.take_notification_receiver());
+        Ok(server)
     }
 
     /// Tools advertised by this server.
@@ -415,6 +440,133 @@ impl McpServer {
     /// Server-advertised capabilities captured at handshake.
     pub async fn capabilities(&self) -> McpServerCapabilities {
         self.inner.lock().await.capabilities.clone()
+    }
+
+    /// Spawn the background listener for server-initiated notifications
+    /// (id-less inbound JSON-RPC messages). On
+    /// `notifications/tools/list_changed` the tool list is re-fetched so
+    /// servers with dynamic toolsets (load/unload on demand) are reflected
+    /// without a reconnect. Other notification methods are logged and
+    /// ignored.
+    ///
+    /// The listener holds only `Weak` handles to the server's parts: it must
+    /// not keep the transport (and thereby the stdio child) alive. When the
+    /// last strong `McpServer`/transport reference drops, the channel's
+    /// senders drop too, `recv()` returns `None`, and any straggler
+    /// notification finds the upgrades failing — either way the task exits
+    /// without pinning the child process.
+    fn spawn_notification_listener(
+        &self,
+        receiver: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcNotification>>,
+    ) {
+        let Some(mut receiver) = receiver else {
+            return;
+        };
+        let inner = std::sync::Arc::downgrade(&self.inner);
+        let transport = std::sync::Arc::downgrade(&self.transport);
+        let epoch_gate = std::sync::Arc::downgrade(&self.epoch_gate);
+        let serial_gate = self.serial_gate.as_ref().map(std::sync::Arc::downgrade);
+        let recovery = std::sync::Arc::downgrade(&self.recovery);
+        zeroclaw_spawn::spawn!(async move {
+            while let Some(notification) = receiver.recv().await {
+                // Rebuild a transient handle from the weak parts. If any part
+                // can no longer be upgraded the owning server is gone; exit
+                // rather than act on a half-alive connection.
+                let (Some(inner), Some(transport), Some(epoch_gate), Some(recovery)) = (
+                    inner.upgrade(),
+                    transport.upgrade(),
+                    epoch_gate.upgrade(),
+                    recovery.upgrade(),
+                ) else {
+                    break;
+                };
+                let serial_gate = match &serial_gate {
+                    Some(weak) => match weak.upgrade() {
+                        Some(gate) => Some(gate),
+                        None => break,
+                    },
+                    None => None,
+                };
+                let server = McpServer {
+                    inner,
+                    transport,
+                    epoch_gate,
+                    serial_gate,
+                    recovery,
+                };
+                if notification.method == TOOLS_LIST_CHANGED_METHOD {
+                    if let Err(error) = server.refresh_tools().await {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "notification": &notification.method,
+                                "error": format!("{error:#}"),
+                            })),
+                            "mcp_client: tools/list refresh after list_changed notification failed"
+                        );
+                    }
+                } else {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "method": &notification.method,
+                            })),
+                        "mcp_client: ignored server-initiated notification"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Re-fetch `tools/list` from the server and replace the cached tool
+    /// definitions, bumping `tools_generation` so the registry notices.
+    /// Called on `notifications/tools/list_changed` and after a transport
+    /// recovery re-handshake (which invalidates the previous session's tool
+    /// list). Uses the ordinary dispatch path, so recovery gating and
+    /// timeouts apply as for any other request.
+    pub async fn refresh_tools(&self) -> Result<()> {
+        let server_name = self.inner.lock().await.config.name.clone();
+        let operation = "tools/list refresh".to_string();
+        let resp = self
+            .dispatch_rpc("tools/list", json!({}), RECV_TIMEOUT_SECS, &operation)
+            .await?;
+        if let Some(err) = resp.error {
+            bail!(
+                "MCP tools/list refresh on `{server_name}` error {}: {}",
+                err.code,
+                err.message
+            );
+        }
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::Error::msg("tools/list refresh returned no result"))?;
+        let tool_list: McpToolsListResult = serde_json::from_value(result)
+            .with_context(|| format!("failed to parse tools/list refresh from `{server_name}`"))?;
+        let tool_count = tool_list.tools.len();
+        let mut inner = self.inner.lock().await;
+        inner.tools = tool_list.tools;
+        inner.tools_generation = inner.tools_generation.wrapping_add(1);
+        // Any successful refresh proves the server is answering tools/list
+        // again; refill the post-recovery budget for the next outage.
+        inner.refresh_budget = POST_RECOVERY_REFRESH_BUDGET;
+        drop(inner);
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({
+                    "mcp_server": &server_name,
+                    "tool_count": tool_count,
+                })),
+            "mcp_client: refreshed tool list after server notification"
+        );
+        Ok(())
     }
 
     /// Health-check the underlying transport without sending a real request.
@@ -613,6 +765,48 @@ impl McpServer {
         // release any writers waiting on the barrier.
         self.recovery.finish(observed_epoch);
         drop(serial_guard);
+        drop(epoch);
+        // The re-handshake invalidated the previous session's tool list:
+        // re-fetch so `inner.tools` does not serve stale definitions until the
+        // next full reconnect. Guards are fully released first — refresh_tools
+        // goes through the ordinary dispatch path, which acquires the same
+        // epoch/serial gates.
+        //
+        // Budgeted: a refresh that itself fails with an unknown outcome arms
+        // another recovery, which would reach this point again — the budget
+        // bounds that feedback loop. A failure here is non-fatal: the recovery
+        // itself succeeded and the next list_changed notification (whose
+        // listener does not consume budget) retries.
+        let refresh_allowed = {
+            let mut inner = self.inner.lock().await;
+            if inner.refresh_budget == 0 {
+                false
+            } else {
+                inner.refresh_budget -= 1;
+                true
+            }
+        };
+        if refresh_allowed {
+            if let Err(error) = self.refresh_tools().await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{error:#}"),
+                        })),
+                    "mcp_client: tools/list refresh after transport recovery failed"
+                );
+            }
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject),
+                "mcp_client: post-recovery tools/list refresh budget exhausted; \
+                 keeping the previous tool list until the server sends \
+                 notifications/tools/list_changed"
+            );
+        }
         Ok(())
     }
 
@@ -885,10 +1079,38 @@ pub const MCP_TOOL_NAME_SEPARATOR: &str = "__";
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
-    /// prefixed_name → (server_index, original_tool_name)
-    tool_index: HashMap<String, (usize, String)>,
+    /// prefixed_name → (server_index, original_tool_name).
+    ///
+    /// Interior-mutable so a `tools/list_changed` refresh (which rewrites a
+    /// server's tool list behind its [`McpServer`] handle) can rebuild this
+    /// index in place without replacing the shared `Arc<McpRegistry>` the
+    /// daemon hands to every run.
+    tool_index: SyncRwLock<HashMap<String, (usize, String)>>,
+    /// `indexed_generations[i]` is the `tools_generation` of `servers[i]` as
+    /// of the last time this server's `tool_index` entries were (re)built.
+    /// Kept in lockstep with `servers` (same length and order). A mismatch
+    /// with the server's live generation marks that server's index slice
+    /// stale for the next [`Self::ensure_index_fresh`] pass.
+    indexed_generations: SyncMutex<Vec<u64>>,
     /// server name → index in `servers`.
     server_index: HashMap<String, usize>,
+}
+
+/// Build the `tool_index` entries for one server's advertised tools.
+fn server_tool_index_entries(
+    server_name: &str,
+    tools: &[McpToolDef],
+    server_idx: usize,
+) -> Vec<(String, (usize, String))> {
+    tools
+        .iter()
+        .map(|tool| {
+            (
+                format!("{server_name}{MCP_TOOL_NAME_SEPARATOR}{}", tool.name),
+                (server_idx, tool.name.clone()),
+            )
+        })
+        .collect()
 }
 
 impl McpRegistry {
@@ -896,6 +1118,7 @@ impl McpRegistry {
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
+        let mut indexed_generations = Vec::new();
         let mut server_index = HashMap::new();
 
         for config in configs {
@@ -904,13 +1127,16 @@ impl McpRegistry {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
                     // Collect tools while holding the lock once, then release
-                    let tools = server.tools().await;
-                    for tool in &tools {
-                        // Prefix prevents name collisions across servers
-                        let prefixed =
-                            format!("{}{MCP_TOOL_NAME_SEPARATOR}{}", config.name, tool.name);
-                        tool_index.insert(prefixed, (server_idx, tool.name.clone()));
+                    let (tools, generation) = {
+                        let inner = server.inner.lock().await;
+                        (inner.tools.clone(), inner.tools_generation)
+                    };
+                    for (prefixed, entry) in
+                        server_tool_index_entries(&config.name, &tools, server_idx)
+                    {
+                        tool_index.insert(prefixed, entry);
                     }
+                    indexed_generations.push(generation);
                     servers.push(server);
                 }
                 // Non-fatal — log and continue with remaining servers
@@ -927,7 +1153,8 @@ impl McpRegistry {
 
         Ok(Self {
             servers,
-            tool_index,
+            tool_index: SyncRwLock::new(tool_index),
+            indexed_generations: SyncMutex::new(indexed_generations),
             server_index,
         })
     }
@@ -988,6 +1215,8 @@ impl McpRegistry {
                 next_id: AtomicU32::new(0),
                 tools: Vec::new(),
                 capabilities: McpServerCapabilities::default(),
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
             };
             McpServer {
                 inner: Arc::new(Mutex::new(inner)),
@@ -1009,7 +1238,10 @@ impl McpRegistry {
         }
         Self {
             servers,
-            tool_index,
+            tool_index: SyncRwLock::new(tool_index),
+            // stub_server handles all start at tools_generation 0; recording
+            // 0 here keeps the (empty) index marked fresh for those handles.
+            indexed_generations: SyncMutex::new(vec![0u64; n]),
             server_index,
         }
     }
@@ -1049,19 +1281,23 @@ impl McpRegistry {
     /// and rebuild via `from_servers`.
     pub async fn from_servers(servers: Vec<McpServer>) -> Self {
         let mut tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut indexed_generations = Vec::with_capacity(servers.len());
         let mut server_index: HashMap<String, usize> = HashMap::with_capacity(servers.len());
         for (idx, server) in servers.iter().enumerate() {
-            let name = server.name().await;
-            let tools = server.tools().await;
-            for tool in &tools {
-                let prefixed = format!("{name}{MCP_TOOL_NAME_SEPARATOR}{}", tool.name);
-                tool_index.insert(prefixed, (idx, tool.name.clone()));
+            let (name, tools, generation) = {
+                let inner = server.inner.lock().await;
+                (inner.config.name.clone(), inner.tools.clone(), inner.tools_generation)
+            };
+            for (prefixed, entry) in server_tool_index_entries(&name, &tools, idx) {
+                tool_index.insert(prefixed, entry);
             }
+            indexed_generations.push(generation);
             server_index.insert(name, idx);
         }
         Self {
             servers,
-            tool_index,
+            tool_index: SyncRwLock::new(tool_index),
+            indexed_generations: SyncMutex::new(indexed_generations),
             server_index,
         }
     }
@@ -1087,9 +1323,14 @@ impl McpRegistry {
             server_index.insert(name, idx);
             servers.push(server);
         }
+        let server_count = servers.len();
         Self {
             servers,
-            tool_index,
+            tool_index: SyncRwLock::new(tool_index),
+            // Tool index is empty by contract here; generation 0 marks the
+            // (empty) entries fresh, and any ensure_index_fresh pass on a
+            // real handle simply re-reads its current tool list.
+            indexed_generations: SyncMutex::new(vec![0u64; server_count]),
             server_index,
         }
     }
@@ -1140,6 +1381,8 @@ impl McpRegistry {
             next_id: AtomicU32::new(0),
             tools: Vec::new(),
             capabilities: McpServerCapabilities::default(),
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
         McpServer {
             inner: std::sync::Arc::new(Mutex::new(inner)),
@@ -1204,6 +1447,8 @@ impl McpRegistry {
                 input_schema: serde_json::json!({}),
             }],
             capabilities: McpServerCapabilities::default(),
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
         let server = McpServer {
             inner: Arc::new(Mutex::new(inner)),
@@ -1218,39 +1463,119 @@ impl McpRegistry {
         server_index.insert(server_name.to_string(), 0usize);
         Self {
             servers: vec![server],
-            tool_index,
+            tool_index: SyncRwLock::new(tool_index),
+            indexed_generations: SyncMutex::new(vec![0]),
             server_index,
         }
     }
 
     /// All prefixed tool names across all connected servers.
+    ///
+    /// Snapshot of the current index — a server whose tool list changed after
+    /// its index entries were built appears stale until
+    /// [`Self::ensure_index_fresh`] runs (via [`Self::refreshed_tool_names`],
+    /// `get_tool_def`, or `call_tool`).
     pub fn tool_names(&self) -> Vec<String> {
-        self.tool_index.keys().cloned().collect()
+        self.tool_index.read().keys().cloned().collect()
     }
 
-    /// Tool definition for a given prefixed name (cloned).
+    /// All prefixed tool names, after reconciling the index with every
+    /// server's live tool list. This is the list callers that build
+    /// model-visible tool inventories (deferred stubs, eager wrappers)
+    /// should use so `notifications/tools/list_changed` refreshes surface on
+    /// the next run.
+    pub async fn refreshed_tool_names(&self) -> Vec<String> {
+        self.ensure_index_fresh().await;
+        self.tool_index.read().keys().cloned().collect()
+    }
+
+    /// Bring `tool_index` back in sync with servers whose tool list changed
+    /// since their entries were built (detected by comparing each server's
+    /// live `tools_generation` against `indexed_generations`). Cheap when
+    /// nothing changed: one brief per-server lock, no index writes.
+    async fn ensure_index_fresh(&self) {
+        // Snapshot each server's live generation first (brief per-server
+        // lock, no registry locks held across these awaits).
+        let mut live_generations = Vec::with_capacity(self.servers.len());
+        for server in &self.servers {
+            live_generations.push(server.inner.lock().await.tools_generation);
+        }
+        let stale: Vec<usize> = {
+            let indexed = self.indexed_generations.lock();
+            (0..self.servers.len())
+                .filter(|&i| indexed.get(i) != live_generations.get(i))
+                .collect()
+        };
+        if stale.is_empty() {
+            return;
+        }
+        // Re-read the (already refreshed) tool lists for the stale servers.
+        let mut updates = Vec::with_capacity(stale.len());
+        for i in stale {
+            let inner = self.servers[i].inner.lock().await;
+            updates.push((
+                i,
+                inner.config.name.clone(),
+                inner.tools.clone(),
+                inner.tools_generation,
+            ));
+        }
+        // Apply under the write locks. No await is held while these parking
+        // locks are taken; re-check under the lock so a concurrent ensure pass
+        // does not double-apply the same generation.
+        let mut index = self.tool_index.write();
+        let mut indexed = self.indexed_generations.lock();
+        for (i, name, tools, generation) in updates {
+            if indexed.get(i) == Some(&generation) {
+                continue;
+            }
+            // Drop this server's previous entries, then insert the new ones.
+            index.retain(|_, (idx, _)| *idx != i);
+            for (prefixed, entry) in server_tool_index_entries(&name, &tools, i) {
+                index.insert(prefixed, entry);
+            }
+            indexed[i] = generation;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &name,
+                        "tool_count": tools.len(),
+                    })),
+                "mcp_client: tool index refreshed after server tool list changed"
+            );
+        }
+    }
+
+    /// Tool definition for a given prefixed name (cloned). Reconciles the
+    /// index with servers whose tool list changed since it was built, so a
+    /// newly advertised tool is found without a reconnect.
     pub async fn get_tool_def(&self, prefixed_name: &str) -> Option<McpToolDef> {
-        let (server_idx, original_name) = self.tool_index.get(prefixed_name)?;
-        let inner = self.servers[*server_idx].inner.lock().await;
+        self.ensure_index_fresh().await;
+        let (server_idx, original_name) = self.tool_index.read().get(prefixed_name)?.clone();
+        let inner = self.servers[server_idx].inner.lock().await;
         inner
             .tools
             .iter()
-            .find(|t| &t.name == original_name)
+            .find(|t| t.name == original_name)
             .cloned()
     }
 
-    /// Execute a tool by prefixed name.
-    ///
-    /// Returns the raw JSON-RPC result value. Callers that surface the result
-    /// to the model should run
-    /// `embedded_resource::format_mcp_tool_result_for_model` so
-    /// `resource`+`blob` content is materialized instead of pretty-printed.
+    /// Execute a tool by prefixed name. Reconciles the index first (see
+    /// [`Self::get_tool_def`]) so a tool advertised after connect routes
+    /// correctly.
     pub async fn call_tool(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
+        self.ensure_index_fresh().await;
+        let (server_idx, original_name) = self
+            .tool_index
+            .read()
+            .get(prefixed_name)
+            .cloned()
+            .ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -1260,8 +1585,8 @@ impl McpRegistry {
             );
             anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
         })?;
-        self.servers[*server_idx]
-            .call_tool(original_name, arguments)
+        self.servers[server_idx]
+            .call_tool(&original_name, arguments)
             .await
     }
 
@@ -1274,7 +1599,7 @@ impl McpRegistry {
     }
 
     pub fn tool_count(&self) -> usize {
-        self.tool_index.len()
+        self.tool_index.read().len()
     }
 
     /// Names of all connected servers.
@@ -1326,16 +1651,31 @@ impl McpRegistry {
             new_server_index.insert(name.clone(), new_idx);
         }
 
-        let mut new_tool_index = HashMap::with_capacity(self.tool_index.len());
-        for (prefixed, (old_srv_idx, tool_name)) in &self.tool_index {
-            if let Some(&new_srv_idx) = old_to_new_idx.get(old_srv_idx) {
-                new_tool_index.insert(prefixed.clone(), (new_srv_idx, tool_name.clone()));
+        let mut new_tool_index = HashMap::with_capacity(self.tool_index.read().len());
+        {
+            let tool_index = self.tool_index.read();
+            for (prefixed, (old_srv_idx, tool_name)) in tool_index.iter() {
+                if let Some(&new_srv_idx) = old_to_new_idx.get(old_srv_idx) {
+                    new_tool_index.insert(prefixed.clone(), (new_srv_idx, tool_name.clone()));
+                }
             }
         }
 
         self.servers = new_servers;
         self.server_index = new_server_index;
-        self.tool_index = new_tool_index;
+        *self.tool_index.write() = new_tool_index;
+        // Re-derive the per-server generation bookkeeping from the surviving
+        // handles so `indexed_generations` stays aligned with `servers` (the
+        // HashMap iteration order above is arbitrary; positions must not be
+        // guessed). Surviving handles kept their tool lists, so their live
+        // generations are exactly what the freshly remapped index reflects.
+        {
+            let mut new_generations = Vec::with_capacity(self.servers.len());
+            for server in &self.servers {
+                new_generations.push(server.inner.lock().await.tools_generation);
+            }
+            *self.indexed_generations.get_mut() = new_generations;
+        }
 
         dead
     }
@@ -1822,6 +2162,8 @@ mod tests {
             next_id: AtomicU32::new(3),
             tools: vec![],
             capabilities: McpServerCapabilities::default(),
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
@@ -2308,6 +2650,8 @@ mod tests {
             next_id: AtomicU32::new(3),
             tools: vec![],
             capabilities: McpServerCapabilities::default(),
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
@@ -2337,6 +2681,8 @@ mod tests {
                 input_schema: serde_json::json!({}),
             }],
             capabilities: McpServerCapabilities::default(),
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
@@ -2384,7 +2730,8 @@ mod tests {
         server_index.insert("fake".to_string(), 0usize);
         let registry = Arc::new(McpRegistry {
             servers: vec![server],
-            tool_index,
+            tool_index: SyncRwLock::new(tool_index),
+            indexed_generations: SyncMutex::new(vec![0]),
             server_index,
         });
 
@@ -2444,6 +2791,8 @@ mod tests {
             next_id: AtomicU32::new(3),
             tools: vec![],
             capabilities,
+            tools_generation: 0,
+            refresh_budget: POST_RECOVERY_REFRESH_BUDGET,
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
@@ -2980,6 +3329,191 @@ done
             .expect("close transport");
     }
 
+    /// A server that advertises `probe` + `load` at connect, then — when
+    /// `load` is called — flips an internal state file and emits
+    /// `notifications/tools/list_changed`. Subsequent `tools/list` calls
+    /// also serve `late_tool`. The registry must surface `late_tool` without
+    /// any reconnect: this is the dynamic-toolset contract (Konnect-style
+    /// `load_toolset` servers) that previously broke because the stdio read
+    /// loop dropped id-less server messages on the floor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tools_list_changed_notification_refreshes_registry_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("list-changed-mcp.sh");
+        let state_file = temp.path().join("state");
+        write_script(
+            &script_path,
+            br#"#!/bin/sh
+# state 0 = initial toolset; state 1 = expanded toolset after `load`
+echo 0 > "$1"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":true}},\"serverInfo\":{\"name\":\"list-changed\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"tools/list"'*)
+      if [ "$(cat "$1")" = "1" ]; then
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"probe\",\"description\":\"p\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"load\",\"description\":\"l\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"late_tool\",\"description\":\"added after load\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      else
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"probe\",\"description\":\"p\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"load\",\"description\":\"l\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      fi
+      ;;
+    *'"method":"tools/call"'*)
+      case "$line" in
+        *'"name":"load"'*)
+          echo 1 > "$1"
+          printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"loaded\"}]}}"
+          printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+          ;;
+        *)
+          printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        );
+
+        let config = stdio_test_config(
+            "list-changed",
+            &script_path,
+            vec![state_file.display().to_string()],
+            5,
+        );
+        let registry = McpRegistry::connect_all(&[config]).await.expect("connect");
+        assert_eq!(registry.tool_count(), 2);
+        assert!(registry
+            .tool_names()
+            .contains(&"list-changed__probe".to_string()));
+        assert!(!registry
+            .tool_names()
+            .contains(&"list-changed__late_tool".to_string()));
+
+        // Trigger the server-side toolset expansion. The tools/call response
+        // arrives first, then the notification; the client's listener
+        // re-fetches tools/list asynchronously.
+        let result = registry
+            .call_tool("list-changed__load", json!({}))
+            .await
+            .expect("load call");
+        assert!(result.to_string().contains("loaded"), "got: {result}");
+
+        // The refreshed names must eventually include the late tool.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if registry
+                    .refreshed_tool_names()
+                    .await
+                    .contains(&"list-changed__late_tool".to_string())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late tool never appeared in refreshed names after list_changed");
+
+        // The new tool resolves through the refreshed index and is callable
+        // on the SAME connection — no reconnect happened.
+        let def = registry
+            .get_tool_def("list-changed__late_tool")
+            .await
+            .expect("late tool def after refresh");
+        assert_eq!(def.name, "late_tool");
+        let result = registry
+            .call_tool("list-changed__late_tool", json!({}))
+            .await
+            .expect("late tool call after refresh");
+        assert_eq!(result, json!({"ok": true}));
+        assert_eq!(registry.tool_count(), 3);
+    }
+
+    /// Deferred stub construction must also see post-connect tool changes:
+    /// `DeferredMcpToolSet::from_registry` feeds the model's tool inventory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_stub_set_reflects_list_changed_refresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("deferred-list-changed.sh");
+        let state_file = temp.path().join("state");
+        write_script(
+            &script_path,
+            br#"#!/bin/sh
+echo 0 > "$1"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":true}},\"serverInfo\":{\"name\":\"deferred-lc\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"tools/list"'*)
+      if [ "$(cat "$1")" = "1" ]; then
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"probe\",\"description\":\"p\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"load\",\"description\":\"l\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"late_tool\",\"description\":\"late\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      else
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"probe\",\"description\":\"p\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"load\",\"description\":\"l\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      fi
+      ;;
+    *'"method":"tools/call"'*)
+      case "$line" in
+        *'"name":"load"'*)
+          echo 1 > "$1"
+          printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"loaded\"}]}}"
+          printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+          ;;
+        *)
+          printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        );
+
+        let config = stdio_test_config(
+            "deferred-lc",
+            &script_path,
+            vec![state_file.display().to_string()],
+            5,
+        );
+        let registry = Arc::new(McpRegistry::connect_all(&[config]).await.expect("connect"));
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+
+        let before = crate::mcp_deferred::DeferredMcpToolSet::from_registry(
+            Arc::clone(&registry),
+            Arc::clone(&security),
+        )
+        .await;
+        assert!(!before
+            .stub_names()
+            .contains(&"deferred-lc__late_tool"));
+
+        registry
+            .call_tool("deferred-lc__load", json!({}))
+            .await
+            .expect("load call");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let set = crate::mcp_deferred::DeferredMcpToolSet::from_registry(
+                    Arc::clone(&registry),
+                    Arc::clone(&security),
+                )
+                .await;
+                if set.stub_names().contains(&"deferred-lc__late_tool") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred stub set never reflected the list_changed refresh");
+    }
+
     // ── Server capabilities parsing ──────────────────────────────────────────
 
     #[test]
@@ -3050,12 +3584,36 @@ done
             .mount(&server)
             .await;
 
+        // tools/list → the connect-time tool list. Highest priority and
+        // capped at one call, so it answers the initial `McpServer::connect`.
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "tools/list"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": 2,
                 "result": {"tools": [{"name": "echo", "description": "d", "inputSchema": {"type": "object"}}]}
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // tools/list (post-recovery refresh) → the stale-session recovery
+        // path re-fetches the tool list after its re-handshake so a
+        // re-established session never serves pre-reconnect tool definitions.
+        // The response adds a marker tool whose appearance in `srv.tools()`
+        // lets the test wait deterministically for the refresh to land
+        // before verifying mock expectations.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {"tools": [
+                    {"name": "echo", "description": "d", "inputSchema": {"type": "object"}},
+                    {"name": "post_recovery_tool", "description": "d", "inputSchema": {"type": "object"}}
+                ]}
             })))
             .expect(1)
             .mount(&server)
@@ -3094,6 +3652,24 @@ done
         })
         .await
         .expect("stale-session recovery did not complete");
+        // The recovery path re-fetches the tool list after the re-handshake;
+        // wait for the marker tool from that second tools/list response so
+        // `verify()` cannot race the asynchronous refresh.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if srv
+                    .tools()
+                    .await
+                    .iter()
+                    .any(|tool| tool.name == "post_recovery_tool")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("post-recovery tools/list refresh did not complete");
         server.verify().await;
     }
 

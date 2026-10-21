@@ -15,7 +15,9 @@ use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, oneshot};
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 
-use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::mcp_protocol::{
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, is_server_notification,
+};
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
 /// Maximum bytes for a single JSON-RPC response.
@@ -453,6 +455,18 @@ pub(crate) trait SharedMcpTransportConn: Send + Sync {
         true
     }
 
+    /// Take the receiver for server-initiated JSON-RPC notifications (inbound
+    /// messages with a `method` and no `id`), if this transport surfaces
+    /// them. Transports that never deliver server notifications keep the
+    /// default `None` (e.g. streamable HTTP, whose POST response path only
+    /// models request/response pairs). Only the first caller receives a
+    /// channel; later callers get `None`.
+    fn take_notification_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcNotification>> {
+        None
+    }
+
     /// Close the connection.
     async fn close(&self) -> Result<()>;
 }
@@ -518,6 +532,14 @@ pub struct StdioTransport {
     /// child-exit watcher when the direct child process exits. Read
     /// synchronously by `health_check`.
     child_exited: Arc<AtomicBool>,
+    /// Server-initiated notifications (inbound `method` + no `id`) read off
+    /// the child's stdout by any generation's read loop. The single receiver
+    /// is handed out once via
+    /// [`SharedMcpTransportConn::take_notification_receiver`]; it closes when
+    /// the last read loop ends (child dead / transport closed).
+    notification_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcNotification>,
+    notification_rx:
+        ParkingMutex<Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcNotification>>>,
     #[cfg(all(test, unix))]
     write_test_hook: ParkingMutex<Option<Arc<StdioWriteTestHook>>>,
 }
@@ -580,6 +602,7 @@ impl StdioTransport {
         let alive = Arc::new(AtomicBool::new(false));
         let active_generation = Arc::new(AtomicU64::new(1));
         let child_exited = Arc::new(AtomicBool::new(false));
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::unbounded_channel();
         let conn = Self::spawn(
             config,
             1,
@@ -587,6 +610,7 @@ impl StdioTransport {
             Arc::clone(&alive),
             Arc::clone(&active_generation),
             Arc::clone(&child_exited),
+            notification_tx.clone(),
         )?;
         Ok(Self {
             config: config.clone(),
@@ -598,6 +622,8 @@ impl StdioTransport {
             alive,
             active_generation,
             child_exited,
+            notification_tx,
+            notification_rx: ParkingMutex::new(Some(notification_rx)),
             #[cfg(all(test, unix))]
             write_test_hook: ParkingMutex::new(None),
         })
@@ -615,6 +641,7 @@ impl StdioTransport {
         alive: Arc<AtomicBool>,
         active_generation: Arc<AtomicU64>,
         child_exited: Arc<AtomicBool>,
+        notifications: tokio::sync::mpsc::UnboundedSender<JsonRpcNotification>,
     ) -> Result<StdioConn> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
@@ -663,6 +690,7 @@ impl StdioTransport {
             pending,
             alive,
             active_generation,
+            notifications,
         ));
 
         let child = Arc::new(tokio::sync::Mutex::new(child));
@@ -962,12 +990,40 @@ async fn stdio_read_loop(
     pending: PendingMap,
     alive: Arc<AtomicBool>,
     active_generation: Arc<AtomicU64>,
+    notifications: tokio::sync::mpsc::UnboundedSender<JsonRpcNotification>,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
         match read_bounded_line(&mut reader, MAX_LINE_BYTES).await {
             Ok(BoundedLine::Line { bytes: line, .. }) => {
-                let Ok(response) = serde_json::from_slice::<JsonRpcResponse>(&line) else {
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                // Server-initiated notification (a `method` with no `id`):
+                // route to the notification channel instead of the id-keyed
+                // pending map, which would otherwise drop it.
+                if is_server_notification(&value) {
+                    match serde_json::from_value::<JsonRpcNotification>(value) {
+                        Ok(notification) => {
+                            let _ = notifications.send(notification);
+                        }
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                ),
+                                &format!(
+                                    "mcp_transport: dropped unparsable stdio notification from \
+                                     `{server_name}`: {error}"
+                                )
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value) else {
                     continue;
                 };
                 let response_id = response.id.as_ref().and_then(serde_json::Value::as_u64);
@@ -1100,6 +1156,7 @@ impl SharedMcpTransportConn for StdioTransport {
             Arc::clone(&self.alive),
             Arc::clone(&self.active_generation),
             Arc::clone(&self.child_exited),
+            self.notification_tx.clone(),
         )?;
         state.conn = Some(conn);
         Ok(())
@@ -1127,6 +1184,12 @@ impl SharedMcpTransportConn for StdioTransport {
         // exits while a descendant keeps the inherited stdout pipe open is
         // reported unhealthy instead of falsely alive.
         self.alive.load(Ordering::Acquire) && !self.child_exited.load(Ordering::Acquire)
+    }
+
+    fn take_notification_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcNotification>> {
+        self.notification_rx.lock().take()
     }
 }
 
@@ -1357,6 +1420,13 @@ pub struct SseTransport {
     shared: std::sync::Arc<Mutex<SseSharedState>>,
     pending: SsePendingMap,
     notify: std::sync::Arc<Notify>,
+    /// Server-initiated notifications (inbound `method` + no `id`) read off
+    /// the event stream by any generation of the reader task. The single
+    /// receiver is handed out once via
+    /// [`SharedMcpTransportConn::take_notification_receiver`].
+    notification_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcNotification>,
+    notification_rx:
+        ParkingMutex<Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcNotification>>>,
 }
 
 struct SseConnState {
@@ -1390,6 +1460,7 @@ impl SseTransport {
             require_https_url(&config.name, &sse_url, "configured remote URL")?;
         }
         let client = build_remote_http_client(config)?;
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             sse_url,
@@ -1407,6 +1478,8 @@ impl SseTransport {
             shared: std::sync::Arc::new(Mutex::new(SseSharedState::default())),
             pending: Arc::new(ParkingMutex::new(HashMap::new())),
             notify: std::sync::Arc::new(Notify::new()),
+            notification_tx,
+            notification_rx: ParkingMutex::new(Some(notification_rx)),
         })
     }
 
@@ -1475,6 +1548,7 @@ impl SseTransport {
         let shared = self.shared.clone();
         let pending = Arc::clone(&self.pending);
         let notify = self.notify.clone();
+        let notifications = self.notification_tx.clone();
         let sse_url = self.sse_url.clone();
         let server_name = self.server_name.clone();
         let max_response_bytes = self.max_response_bytes;
@@ -1556,7 +1630,18 @@ impl SseTransport {
                             cur_data.clear();
                             cur_bytes = 0;
                             let id = cur_id.take();
-                            handle_sse_event(&server_name, &sse_url, &shared, &pending, &notify, event.as_deref(), id.as_deref(), data).await;
+                            handle_sse_event(
+                                &server_name,
+                                &sse_url,
+                                &shared,
+                                &pending,
+                                &notify,
+                                &notifications,
+                                event.as_deref(),
+                                id.as_deref(),
+                                data,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -1708,6 +1793,7 @@ async fn handle_sse_event(
     shared: &std::sync::Arc<Mutex<SseSharedState>>,
     pending: &SsePendingMap,
     notify: &std::sync::Arc<Notify>,
+    notifications: &tokio::sync::mpsc::UnboundedSender<JsonRpcNotification>,
     event: Option<&str>,
     _id: Option<&str>,
     data: String,
@@ -1736,6 +1822,16 @@ async fn handle_sse_event(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return;
     };
+
+    // Server-initiated notification (a `method` with no `id`): route to the
+    // notification channel instead of the id-keyed pending map, which would
+    // otherwise drop it.
+    if is_server_notification(&value) {
+        if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(value) {
+            let _ = notifications.send(notification);
+        }
+        return;
+    }
 
     let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(value.clone()) else {
         let _ = serde_json::from_value::<JsonRpcRequest>(value);
@@ -2112,6 +2208,12 @@ impl SharedMcpTransportConn for SseTransport {
     async fn close(&self) -> Result<()> {
         self.teardown().await;
         Ok(())
+    }
+
+    fn take_notification_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcNotification>> {
+        self.notification_rx.lock().take()
     }
 }
 
@@ -2705,6 +2807,7 @@ mod tests {
             &transport.shared,
             &transport.pending,
             &transport.notify,
+            &transport.notification_tx,
             Some("endpoint"),
             None,
             "http://internal.example/messages".to_string(),
