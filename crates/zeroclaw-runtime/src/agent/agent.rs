@@ -1222,6 +1222,7 @@ impl AgentBuilder {
         let allowed = self.allowed_tools.clone();
         if let Some(ref allow_list) = allowed {
             tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
+            tools.narrow_dynamic_mcp_to_caller(allow_list);
         }
 
         // ACP sessions exclude persistent memory: strip memory tools,
@@ -2065,6 +2066,7 @@ impl Agent {
         };
         self.tools
             .retain(|tool| allowed.iter().any(|name| name == tool.name()));
+        self.tools.narrow_dynamic_mcp_to_caller(allowed);
         if let Some(search) = &self.tool_search {
             search.narrow_to_caller(allowed);
         }

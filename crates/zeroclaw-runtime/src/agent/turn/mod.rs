@@ -1879,6 +1879,12 @@ async fn run_tool_call_loop_impl<'a>(
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
+        // Reconcile before resolving per-iteration scopes as well as schemas:
+        // tools advertised mid-turn must be visible to the SOP exclusion pass,
+        // including the snapshot used by parallel tool execution.
+        if let Some(activated) = activated_tools {
+            tools_registry.sync_dynamic_mcp(activated).await;
+        }
         // Re-resolved every iteration, against the tools callable *right now*.
         //
         // A step's scope is resolved by name, so it can only narrow tools that
@@ -2101,15 +2107,6 @@ async fn run_tool_call_loop_impl<'a>(
             } else {
                 (model_provider, provider_name, model, dispatch_model)
             };
-
-        // Mid-session MCP toolsets (notifications/tools/list_changed after
-        // load_toolset/unload_toolset) surface from the next model call in
-        // the SAME turn: reconcile the live activated set before this
-        // iteration's specs are assembled. No-op (and cache-stable) when the
-        // registry has not changed since the last pass.
-        if let Some(activated) = activated_tools {
-            tools_registry.sync_dynamic_mcp(activated).await;
-        }
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             active_model_provider,
