@@ -29528,9 +29528,10 @@ mod tests {
         assert!(sessions.remove(sid).await, "reap must remove the session");
 
         let recovered = dispatcher
-            .rehydrate_reaped_session(sid)
+            .rehydrate_reaped_session(sid, None)
             .await
-            .expect("a reaped ACP session must rehydrate to a working agent");
+            .expect("a reaped ACP session must rehydrate to a working agent")
+            .expect("rehydrated session must be present");
 
         let agent = recovered.lock().await;
         let tool_names = agent.tool_names();
