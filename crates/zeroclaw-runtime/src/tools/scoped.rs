@@ -363,6 +363,19 @@ impl ScopedToolRegistry {
         }
     }
 
+    /// Keep future MCP activations inside a principal ceiling tightened after
+    /// assembly. Pruning current executables alone cannot revoke future names.
+    pub(crate) fn narrow_dynamic_mcp_to_caller(&self, allowed: &[String]) {
+        if let Some(sync) = &self.2 {
+            let mut policy = sync.policy.lock().unwrap_or_else(|e| e.into_inner());
+            let policy = policy.get_or_insert_with(Default::default);
+            match &mut policy.caller_allowed {
+                Some(current) => current.retain(|name| allowed.contains(name)),
+                None => policy.caller_allowed = Some(allowed.to_vec()),
+            }
+        }
+    }
+
     fn refresh_builtin_schemas(&self) {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "post-seal-refresh", 8, 0);
@@ -593,7 +606,7 @@ fn tool_allowed_in_context(name: &str, exclude_memory: bool, acp_delivery: bool)
 pub(crate) struct McpDynamicSync {
     registry: Arc<tools::McpRegistry>,
     security: Arc<SecurityPolicy>,
-    policy: Option<zeroclaw_tools::tool_search::ToolAccessPolicy>,
+    policy: std::sync::Mutex<Option<zeroclaw_tools::tool_search::ToolAccessPolicy>>,
     delegate_handle: Option<DelegateParentToolsHandle>,
     /// Prefixed names registered into the sealed registry at assembly.
     base_names: HashSet<String>,
@@ -607,10 +620,7 @@ impl McpDynamicSync {
     /// Reconcile `activated` with the registry's current tool list. Returns
     /// the number of tools added or withdrawn. Never fails: a registry error
     /// degrades to a no-op pass, leaving the previous surface intact.
-    pub(crate) async fn sync(
-        &self,
-        activated: &Arc<std::sync::Mutex<ActivatedToolSet>>,
-    ) -> usize {
+    pub(crate) async fn sync(&self, activated: &Arc<std::sync::Mutex<ActivatedToolSet>>) -> usize {
         let names: HashSet<String> = self
             .registry
             .refreshed_tool_names()
@@ -658,7 +668,13 @@ impl McpDynamicSync {
             if self.base_names.contains(&name) {
                 continue;
             }
-            if !eager_mcp_tool_allowed(&name, self.policy.as_ref()) {
+            if !eager_mcp_tool_allowed(
+                &name,
+                self.policy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref(),
+            ) {
                 continue;
             }
             {
@@ -682,7 +698,10 @@ impl McpDynamicSync {
                 .activate(name.clone(), Arc::clone(&wrapper));
             if let Some(handle) = &self.delegate_handle {
                 let mut delegate_tools = handle.write();
-                if !delegate_tools.iter().any(|tool| tool.name() == wrapper.name()) {
+                if !delegate_tools
+                    .iter()
+                    .any(|tool| tool.name() == wrapper.name())
+                {
                     delegate_tools.push(wrapper);
                 }
             }
@@ -1169,6 +1188,8 @@ impl ScopedToolRegistry {
                     // Refreshed names so eagerly-registered wrappers include
                     // tools advertised after connect (list_changed).
                     let names = registry.refreshed_tool_names().await;
+                    mcp_tool_names.extend(names.iter().cloned());
+                    let mut base_names = HashSet::new();
                     let mut registered = 0usize;
                     let mut skipped = 0usize;
                     for name in names {
@@ -1178,7 +1199,7 @@ impl ScopedToolRegistry {
                         }
                         if let Some(def) = registry.get_tool_def(&name).await {
                             let wrapper: Arc<dyn Tool> = Arc::new(tools::McpToolWrapper::new(
-                                name,
+                                name.clone(),
                                 def,
                                 Arc::clone(&registry),
                                 Arc::clone(security),
@@ -1189,6 +1210,7 @@ impl ScopedToolRegistry {
                                 mcp_policy.as_ref(),
                             ) {
                                 registered += 1;
+                                base_names.insert(name);
                             }
                         }
                     }
@@ -1215,15 +1237,27 @@ impl ScopedToolRegistry {
                     // new names into the live activated set. Deferred mode
                     // owns its own dynamic surface (tool_search stubs) and
                     // skips this.
-                    mcp_dynamic_sync = Some(Arc::new(McpDynamicSync {
-                        registry: Arc::clone(&registry),
-                        security: Arc::clone(security),
-                        policy: mcp_policy,
-                        delegate_handle: delegate_handle.clone(),
-                        base_names: mcp_tool_names.clone(),
-                        owned: std::sync::Mutex::new(HashSet::new()),
-                        last_seen: std::sync::Mutex::new(None),
-                    }));
+                    if !list_deferred_mcp_specs {
+                        // Eager sessions need the same live activation surface
+                        // as deferred sessions. Without it the turn loop skips
+                        // sync_dynamic_mcp entirely (activated_tools == None).
+                        // Builtin deferral below must reuse this handle, not
+                        // replace it. Listing-only registries never run turns.
+                        activated_handle.get_or_insert_with(|| {
+                            Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()))
+                        });
+                        mcp_dynamic_sync = Some(Arc::new(McpDynamicSync {
+                            registry: Arc::clone(&registry),
+                            security: Arc::clone(security),
+                            policy: std::sync::Mutex::new(mcp_policy),
+                            delegate_handle: delegate_handle.clone(),
+                            // Use actual registrations, not the earlier origin
+                            // snapshot: notifications can land during assembly.
+                            base_names,
+                            owned: std::sync::Mutex::new(HashSet::new()),
+                            last_seen: std::sync::Mutex::new(None),
+                        }));
+                    }
                 }
             }
         }
@@ -1516,16 +1550,14 @@ mod tests {
     async fn mcp_dynamic_sync_surfaces_and_retracts_mid_session_tools() {
         let server = tools::McpRegistry::for_test_make_stub_server("kicad");
         server.set_tools_for_test(&["stub_base"]).await;
-        let registry = Arc::new(tools::McpRegistry::for_test_with_server_handles(
-            vec![("kicad".to_string(), server.clone())],
-        ));
+        let registry = Arc::new(tools::McpRegistry::for_test_with_server_handles(vec![(
+            "kicad".to_string(),
+            server.clone(),
+        )]));
         // Prime the index the way assembly's first read does; the result is
         // the sealed registry's base set.
-        let base_names: HashSet<String> = registry
-            .refreshed_tool_names()
-            .await
-            .into_iter()
-            .collect();
+        let base_names: HashSet<String> =
+            registry.refreshed_tool_names().await.into_iter().collect();
         assert_eq!(
             base_names,
             ["kicad__stub_base"]
@@ -1537,7 +1569,7 @@ mod tests {
         let sync = McpDynamicSync {
             registry,
             security: Arc::new(SecurityPolicy::default()),
-            policy: None,
+            policy: std::sync::Mutex::new(None),
             delegate_handle: None,
             base_names,
             owned: std::sync::Mutex::new(HashSet::new()),
@@ -1557,10 +1589,12 @@ mod tests {
         {
             let guard = activated.lock().unwrap();
             assert!(guard.is_activated("kicad__stub_new"));
-            assert!(guard
-                .tool_specs()
-                .iter()
-                .any(|spec| spec.name == "kicad__stub_new"));
+            assert!(
+                guard
+                    .tool_specs()
+                    .iter()
+                    .any(|spec| spec.name == "kicad__stub_new")
+            );
         }
 
         // No further change: cache-stable no-op.
@@ -1570,6 +1604,578 @@ mod tests {
         server.set_tools_for_test(&["stub_base"]).await;
         assert_eq!(sync.sync(&activated).await, 1);
         assert!(!activated.lock().unwrap().is_activated("kicad__stub_new"));
+    }
+
+    // Exercise the assembly seam rather than manufacturing an activation handle:
+    // that hid the eager-mode initialization bug in the unit test above.
+    async fn dynamic_mcp_fixture(
+        builtin_deferral: bool,
+    ) -> (
+        wiremock::MockServer,
+        Config,
+        Arc<tools::McpRegistry>,
+        tools::McpServer,
+    ) {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let server = mock_mcp_http_server_with_tools(&[("base", "Base tool")]).await;
+        let mut config = builtin_deferral_config(builtin_deferral);
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = false;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "kicad".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "pcb".into(),
+            McpBundleConfig {
+                servers: vec!["kicad".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config.agents.get_mut("default").unwrap().mcp_bundles = vec!["pcb".into()];
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&config.mcp_servers_for_agent("default"))
+                .await
+                .unwrap(),
+        );
+        let handle = registry.server_handles().into_iter().next().unwrap().1;
+        (server, config, registry, handle)
+    }
+
+    async fn assemble_dynamic_mcp(
+        config: &Config,
+        registry: Arc<tools::McpRegistry>,
+        security: &Arc<SecurityPolicy>,
+        built: AllToolsResult,
+        caller_allowed: Option<&[String]>,
+        listing: bool,
+    ) -> ScopedAssembled {
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config,
+            agent_alias: "default",
+            security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: true,
+            list_deferred_mcp_specs: listing,
+            emit_assembly_logs: false,
+            mcp_registry: Some(registry),
+        })
+        .await
+    }
+
+    /// Simulate a tools/list refresh having landed during a tool round. The
+    /// transport's notification delivery is tested in zeroclaw-tools; this
+    /// fixture deliberately isolates assembly -> loop -> provider -> execution.
+    struct ChangeMcpTools(tools::McpServer);
+
+    zeroclaw_api::mock_tool_attribution!(ChangeMcpTools);
+
+    #[async_trait]
+    impl Tool for ChangeMcpTools {
+        fn name(&self) -> &str {
+            "change_mcp_tools"
+        }
+        fn description(&self) -> &str {
+            "Simulate loading or unloading a server toolset"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object", "properties":{"load":{"type":"boolean"}}})
+        }
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let names: &[&str] = if args["load"] == true {
+                &["base", "get_board_info"]
+            } else {
+                &["base"]
+            };
+            self.0.set_tools_for_test(names).await;
+            Ok(ToolResult {
+                success: true,
+                output: "tool list refreshed".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct DynamicMcpProvider {
+        requests: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for DynamicMcpProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "dynamic-mcp-test"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for DynamicMcpProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("test must exercise native tool requests")
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            use zeroclaw_api::model_provider::{ChatResponse, ToolCall};
+
+            let names: Vec<String> = request
+                .tools
+                .unwrap()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            let mut requests = self.requests.lock().unwrap();
+            let step = requests.len();
+            assert_eq!(names.iter().filter(|n| *n == "kicad__base").count(), 1);
+            assert_eq!(names.len(), names.iter().collect::<HashSet<_>>().len());
+            assert_eq!(
+                names.iter().any(|n| n == "kicad__get_board_info"),
+                matches!(step, 1..=4),
+                "loaded schemas must appear on the next request and disappear after unload"
+            );
+            requests.push(names);
+            let call = match step {
+                0 => Some(("change_mcp_tools", r#"{"load":true}"#)),
+                1 => Some(("kicad__get_board_info", "{}")),
+                2 => {
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .any(|m| m.content.contains("board-read-ok"))
+                    );
+                    None // End this turn with the toolset still loaded.
+                }
+                3 => Some(("kicad__get_board_info", "{}")),
+                4 => Some(("change_mcp_tools", r#"{"load":false}"#)),
+                _ => None,
+            };
+            Ok(ChatResponse {
+                text: call.is_none().then(|| "done".into()),
+                tool_calls: call
+                    .map(|(name, arguments)| ToolCall {
+                        id: format!("dynamic-{step}"),
+                        name: name.into(),
+                        arguments: arguments.into(),
+                        extra_content: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_assembly_updates_next_model_request_and_executes_new_tool() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, config, registry, handle) = dynamic_mcp_fixture(false).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({
+                "method":"tools/call", "params":{"name":"get_board_info"}
+            })))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0", "id":body["id"],
+                    "result":{"content":[{"type":"text", "text":"board-read-ok"}]}
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_dynamic_mcp(
+            &config,
+            registry,
+            &security,
+            built_with(vec![Box::new(ChangeMcpTools(handle))]),
+            None,
+            false,
+        )
+        .await;
+        assert!(assembled.tool_search_handle.is_none());
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            assembled.activated_handle.is_some(),
+            "eager MCP needs an activation handle even when all deferral is disabled"
+        );
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = crate::agent::Agent::builder()
+            .model_provider(Box::new(DynamicMcpProvider {
+                requests: Arc::clone(&requests),
+            }))
+            .tools(assembled.registry)
+            // Use ONLY the handle produced by production assembly.
+            .activated_tools(assembled.activated_handle)
+            .exclude_memory(true)
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .security(security)
+            .workspace_dir(workspace.path().to_path_buf())
+            .agent_alias("default".into())
+            .model_name("test-model".into())
+            .model_provider_name("test-provider".into())
+            .build()
+            .unwrap();
+        assert_eq!(agent.turn("load and read").await.unwrap(), "done");
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        // No list change at the boundary: last_seen skips reconciliation, so
+        // the assembly-owned activation state must survive and execute again.
+        assert_eq!(agent.turn("read again, then unload").await.unwrap(), "done");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[0], requests[5]);
+        for index in 2..=4 {
+            assert_eq!(requests[1], requests[index]);
+        }
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_assembly_preserves_caller_and_deny_filters() {
+        let (_server, config, registry, handle) = dynamic_mcp_fixture(false).await;
+        let security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["kicad__denied".into()]),
+            ..SecurityPolicy::default()
+        });
+        let allowed = vec![
+            "kicad__base".into(),
+            "kicad__allowed".into(),
+            "kicad__denied".into(),
+        ];
+        handle
+            .set_tools_for_test(&["base", "denied", "outside_caller"])
+            .await;
+        let assembled = assemble_dynamic_mcp(
+            &config,
+            registry,
+            &security,
+            built_with(Vec::new()),
+            Some(&allowed),
+            false,
+        )
+        .await;
+        let activated = assembled.activated_handle.as_ref().expect("eager handle");
+        let registered_names: HashSet<String> = assembled
+            .registry
+            .iter()
+            .filter(|tool| tool.name().starts_with("kicad__"))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(
+            assembled.registry.2.as_ref().unwrap().base_names,
+            registered_names
+        );
+        handle
+            .set_tools_for_test(&["base", "allowed", "denied", "outside_caller"])
+            .await;
+        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 1);
+        let guard = activated.lock().unwrap();
+        assert!(guard.get_resolved("kicad__allowed").is_some());
+        for denied in ["kicad__denied", "kicad__outside_caller", "kicad__base"] {
+            assert!(guard.get_resolved(denied).is_none());
+        }
+    }
+
+    struct CaptureMcpTools(Arc<std::sync::Mutex<Vec<Vec<String>>>>, bool);
+
+    impl zeroclaw_api::attribution::Attributable for CaptureMcpTools {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "mcp-ceiling-test"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for CaptureMcpTools {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("test must capture native tool requests")
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            let first = {
+                let mut requests = self.0.lock().unwrap();
+                let first = requests.is_empty();
+                requests.push(
+                    request
+                        .tools
+                        .unwrap()
+                        .iter()
+                        .map(|spec| spec.name.clone())
+                        .collect(),
+                );
+                first
+            };
+            // Probe denial even when a provider emits an unadvertised name.
+            let probe_denied = self.1 && first;
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: (!probe_denied).then(|| "done".into()),
+                tool_calls: if probe_denied {
+                    ["denied_a", "denied_b"]
+                        .into_iter()
+                        .map(|id| zeroclaw_api::model_provider::ToolCall {
+                            id: id.into(),
+                            name: "kicad__outside_step".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_sync_precedes_step_scope_for_parallel_dispatch() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, config, registry, handle) = dynamic_mcp_fixture(false).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method":"tools/call"}),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_dynamic_mcp(
+            &config,
+            registry,
+            &security,
+            built_with(Vec::new()),
+            None,
+            false,
+        )
+        .await;
+        // The new name is not in the sealed registry and must enter the step's
+        // exclusion snapshot on this iteration, before native specs are built.
+        handle.set_tools_for_test(&["base", "outside_step"]).await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent_config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_config.resolved.parallel_tools = true;
+        let mut agent = crate::agent::Agent::builder()
+            .model_provider(Box::new(CaptureMcpTools(Arc::clone(&requests), true)))
+            .tools(assembled.registry)
+            .activated_tools(assembled.activated_handle)
+            .config(agent_config)
+            .exclude_memory(true)
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .security(security)
+            .workspace_dir(workspace.path().to_path_buf())
+            .agent_alias("default".into())
+            .model_name("test-model".into())
+            .model_provider_name("test-provider".into())
+            .build()
+            .unwrap();
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "dynamic-mcp-step".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["kicad__base".into()]),
+                    deny: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..Default::default()
+            },
+        };
+        crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            agent.turn("check step scope"),
+        )
+        .await
+        .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|names| names == &["kicad__base"]));
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_cannot_reactivate_tools_after_principal_narrowing() {
+        let (_server, config, registry, handle) = dynamic_mcp_fixture(false).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_dynamic_mcp(
+            &config,
+            registry,
+            &security,
+            built_with(Vec::new()),
+            None,
+            false,
+        )
+        .await;
+        let activated = assembled.activated_handle.clone().expect("eager handle");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let initial_allowed = vec![
+            "kicad__base".into(),
+            "kicad__keep".into(),
+            "kicad__revoke".into(),
+        ];
+        let mut agent = crate::agent::Agent::builder()
+            .model_provider(Box::new(CaptureMcpTools(Arc::clone(&requests), false)))
+            .tools(assembled.registry)
+            .activated_tools(assembled.activated_handle)
+            .allowed_tools(Some(initial_allowed.clone()))
+            .exclude_memory(true)
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .security(security)
+            .workspace_dir(workspace.path().to_path_buf())
+            .agent_alias("default".into())
+            .model_name("test-model".into())
+            .model_provider_name("test-provider".into())
+            .build()
+            .unwrap();
+        handle
+            .set_tools_for_test(&["base", "keep", "revoke", "outside_builder"])
+            .await;
+        assert_eq!(agent.turn("first").await.unwrap(), "done");
+        assert_eq!(requests.lock().unwrap()[0], initial_allowed);
+        assert!(
+            activated
+                .lock()
+                .unwrap()
+                .get("kicad__outside_builder")
+                .is_none()
+        );
+
+        agent.narrow_to_principal_tools(Some(&["kicad__base".into(), "kicad__keep".into()]));
+        assert!(activated.lock().unwrap().get("kicad__revoke").is_none());
+        // Force a changed snapshot: without narrowing the sync policy the next
+        // pass resurrects revoke under the captured construction-time grants.
+        handle
+            .set_tools_for_test(&["base", "keep", "revoke", "outside_builder", "later"])
+            .await;
+        assert_eq!(agent.turn("after revocation").await.unwrap(), "done");
+        assert_eq!(requests.lock().unwrap()[1], ["kicad__base", "kicad__keep"]);
+        assert!(activated.lock().unwrap().get("kicad__revoke").is_none());
+
+        // This API is narrowing-only: a later broader selector cannot undo it.
+        agent.narrow_to_principal_tools(Some(&initial_allowed));
+        handle.set_tools_for_test(&["base", "keep", "revoke"]).await;
+        assert_eq!(agent.turn("still narrowed").await.unwrap(), "done");
+        assert_eq!(requests.lock().unwrap()[2], ["kicad__base", "kicad__keep"]);
+        assert!(activated.lock().unwrap().get("kicad__revoke").is_none());
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_shares_builtin_activation_state_but_listing_needs_none() {
+        let (_server, config, registry, handle) = dynamic_mcp_fixture(true).await;
+        let security = Arc::new(SecurityPolicy::default());
+        let assembled = assemble_dynamic_mcp(
+            &config,
+            Arc::clone(&registry),
+            &security,
+            built_with(vec![Box::new(MockTool("calendar"))]),
+            None,
+            false,
+        )
+        .await;
+        let activated = assembled.activated_handle.as_ref().expect("shared handle");
+        assert!(Arc::ptr_eq(
+            assembled.registry.1.as_ref().unwrap(),
+            activated
+        ));
+        assert!(
+            assembled
+                .registry
+                .hidden_builtin_names()
+                .contains("calendar")
+        );
+        handle.set_tools_for_test(&["base", "get_board_info"]).await;
+        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 1);
+        assembled
+            .tool_search_handle
+            .as_ref()
+            .unwrap()
+            .execute(serde_json::json!({"query":"select:calendar"}))
+            .await
+            .unwrap();
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            activated
+                .lock()
+                .unwrap()
+                .is_activated("kicad__get_board_info")
+        );
+
+        let listing = assemble_dynamic_mcp(
+            &config,
+            registry,
+            &security,
+            built_with(Vec::new()),
+            None,
+            true,
+        )
+        .await;
+        assert!(listing.activated_handle.is_none());
+        assert!(listing.registry.2.is_none());
+        assert!(
+            listing
+                .registry
+                .iter()
+                .any(|t| t.name() == "kicad__get_board_info")
+        );
     }
 
     struct MockTool(&'static str);
