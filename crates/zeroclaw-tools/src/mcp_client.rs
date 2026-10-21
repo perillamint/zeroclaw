@@ -569,6 +569,27 @@ impl McpServer {
         Ok(())
     }
 
+    /// Test-only: replace this server's advertised tool list and bump
+    /// `tools_generation`, simulating a `notifications/tools/list_changed`
+    /// refresh having landed from the live server. Only the in-memory
+    /// snapshot changes (no transport round-trip);
+    /// `McpRegistry::ensure_index_fresh` picks the new list up exactly as it
+    /// does for a listener-driven refresh, so dynamic-surface consumers
+    /// (`refreshed_tool_names`) observe it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn set_tools_for_test(&self, names: &[&str]) {
+        let mut inner = self.inner.lock().await;
+        inner.tools = names
+            .iter()
+            .map(|name| McpToolDef {
+                name: name.to_string(),
+                description: Some("test tool".to_string()),
+                input_schema: serde_json::json!({}),
+            })
+            .collect();
+        inner.tools_generation = inner.tools_generation.wrapping_add(1);
+    }
+
     /// Health-check the underlying transport without sending a real request.
     /// Returns `true` when the transport is alive, `false` otherwise.
     ///

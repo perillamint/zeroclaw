@@ -2102,6 +2102,15 @@ async fn run_tool_call_loop_impl<'a>(
                 (model_provider, provider_name, model, dispatch_model)
             };
 
+        // Mid-session MCP toolsets (notifications/tools/list_changed after
+        // load_toolset/unload_toolset) surface from the next model call in
+        // the SAME turn: reconcile the live activated set before this
+        // iteration's specs are assembled. No-op (and cache-stable) when the
+        // registry has not changed since the last pass.
+        if let Some(activated) = activated_tools {
+            tools_registry.sync_dynamic_mcp(activated).await;
+        }
+
         let mut iteration_tool_specs = build_iteration_tool_specs(
             active_model_provider,
             active_dispatch_model,

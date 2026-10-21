@@ -303,6 +303,10 @@ impl BuildRegistry {
 pub struct ScopedToolRegistry(
     Vec<Box<dyn Tool>>,
     Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    /// Mid-session MCP toolset reconciliation handle (eager mode with a live
+    /// registry). `None` when assembly had no registry or deferred loading
+    /// owns the dynamic surface. See `McpDynamicSync`.
+    Option<Arc<McpDynamicSync>>,
 );
 
 impl std::ops::Deref for ScopedToolRegistry {
@@ -340,6 +344,23 @@ impl ScopedToolRegistry {
                 .unwrap_or_else(|e| e.into_inner())
                 .hidden_builtin_names()
         })
+    }
+
+    /// Reconcile the live activated set with MCP servers whose advertised
+    /// tool list changed mid-session (`notifications/tools/list_changed`,
+    /// e.g. a `load_toolset` round-trip). A no-op when assembly minted no
+    /// dynamic-MCP handle (deferred mode owns its own surface; registries
+    /// without MCP never produce one). Called once per loop iteration,
+    /// before that iteration's tool specs are assembled, so a tool loaded
+    /// earlier in the same turn is callable from the next model call.
+    pub async fn sync_dynamic_mcp(
+        &self,
+        activated: &Arc<std::sync::Mutex<ActivatedToolSet>>,
+    ) -> usize {
+        match &self.2 {
+            Some(sync) => sync.sync(activated).await,
+            None => 0,
+        }
     }
 
     fn refresh_builtin_schemas(&self) {
@@ -411,7 +432,7 @@ impl ScopedToolRegistry {
     /// in shipped builds and the seal holds where it matters.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self(tools, None)
+        Self(tools, None, None)
     }
 }
 
@@ -543,6 +564,147 @@ impl ScopedAssembled {
 fn tool_allowed_in_context(name: &str, exclude_memory: bool, acp_delivery: bool) -> bool {
     (!exclude_memory || !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&name))
         && (acp_delivery || name != "deliver_file")
+}
+
+/// Mid-session MCP toolset reconciliation for an assembled agent.
+///
+/// Konnect-style servers advertise tools dynamically (`load_toolset` /
+/// `unload_toolset` emit `notifications/tools/list_changed`, which the
+/// server's notification listener applies by re-fetching `tools/list`).
+/// The session's sealed `ScopedToolRegistry` is a snapshot taken at
+/// `assemble` time, so a tool that appears afterwards would otherwise never
+/// reach the model. This component closes that gap by mirroring registry
+/// changes into the per-conversation `ActivatedToolSet` — the same live
+/// surface `tool_search` activations use — so `build_iteration_tool_specs`
+/// exposes them from the very next model call, in the same turn.
+///
+/// Semantics:
+/// - A newly advertised name is activated only when the policy admits it and
+///   it is not already in the sealed registry's base set (activating a base
+///   name would duplicate its spec in every iteration).
+/// - A name this sync activated that the server no longer advertises is
+///   withdrawn again. Base-registered names that vanish stay in the sealed
+///   registry until the next session: the activated set cannot withdraw from
+///   the base Vec. Documented limitation, acceptable for `unload_toolset`.
+/// - Each pass is gated by a `last_seen` name snapshot: with no registry
+///   change the tools array stays byte-identical, so provider prompt caches
+///   survive. A real change breaks the cache exactly once, which is the
+///   intended semantic of surfacing new tools.
+pub(crate) struct McpDynamicSync {
+    registry: Arc<tools::McpRegistry>,
+    security: Arc<SecurityPolicy>,
+    policy: Option<zeroclaw_tools::tool_search::ToolAccessPolicy>,
+    delegate_handle: Option<DelegateParentToolsHandle>,
+    /// Prefixed names registered into the sealed registry at assembly.
+    base_names: HashSet<String>,
+    /// Prefixed names this sync activated (and owns withdrawal for).
+    owned: std::sync::Mutex<HashSet<String>>,
+    /// Last registry name snapshot; unchanged means no-op.
+    last_seen: std::sync::Mutex<Option<HashSet<String>>>,
+}
+
+impl McpDynamicSync {
+    /// Reconcile `activated` with the registry's current tool list. Returns
+    /// the number of tools added or withdrawn. Never fails: a registry error
+    /// degrades to a no-op pass, leaving the previous surface intact.
+    pub(crate) async fn sync(
+        &self,
+        activated: &Arc<std::sync::Mutex<ActivatedToolSet>>,
+    ) -> usize {
+        let names: HashSet<String> = self
+            .registry
+            .refreshed_tool_names()
+            .await
+            .into_iter()
+            .collect();
+        // Prompt-cache gate: byte-identical tool arrays across turns unless
+        // the registry actually changed.
+        {
+            let last_seen = self.last_seen.lock().unwrap_or_else(|e| e.into_inner());
+            if last_seen.as_ref() == Some(&names) {
+                return 0;
+            }
+        }
+        *self.last_seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(names.clone());
+        let mut changed = 0usize;
+        // Withdrawals first: names this sync owns that the server no longer
+        // advertises.
+        let vanished: Vec<String> = {
+            let owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+            owned
+                .iter()
+                .filter(|name| !names.contains(*name))
+                .cloned()
+                .collect()
+        };
+        for name in &vanished {
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deactivate(name);
+            if let Some(handle) = &self.delegate_handle {
+                handle.write().retain(|tool| tool.name() != name);
+            }
+            self.owned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(name);
+            changed += 1;
+        }
+        // Additions: advertised since assembly, policy-admitted, neither in
+        // the base set nor already activated (a duplicate spec is a provider
+        // error, not a display quirk).
+        for name in names {
+            if self.base_names.contains(&name) {
+                continue;
+            }
+            if !eager_mcp_tool_allowed(&name, self.policy.as_ref()) {
+                continue;
+            }
+            {
+                let guard = activated.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.is_activated(&name) {
+                    continue;
+                }
+            }
+            let Some(def) = self.registry.get_tool_def(&name).await else {
+                continue;
+            };
+            let wrapper: Arc<dyn Tool> = Arc::new(tools::McpToolWrapper::new(
+                name.clone(),
+                def,
+                Arc::clone(&self.registry),
+                Arc::clone(&self.security),
+            ));
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .activate(name.clone(), Arc::clone(&wrapper));
+            if let Some(handle) = &self.delegate_handle {
+                let mut delegate_tools = handle.write();
+                if !delegate_tools.iter().any(|tool| tool.name() == wrapper.name()) {
+                    delegate_tools.push(wrapper);
+                }
+            }
+            self.owned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name);
+            changed += 1;
+        }
+        if changed > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(::serde_json::json!({
+                        "changed": changed,
+                    })),
+                &format!("MCP dynamic sync: {changed} tool(s) added or withdrawn mid-session")
+            );
+        }
+        changed
+    }
 }
 
 impl ScopedToolRegistry {
@@ -757,6 +919,9 @@ impl ScopedToolRegistry {
         let mut pinned_section = String::new();
         let mut pinned_blocks = Vec::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
+        // Eager-mode mid-session MCP reconciliation handle; populated in the
+        // shared-registry branch below and sealed into the registry.
+        let mut mcp_dynamic_sync: Option<Arc<McpDynamicSync>> = None;
         let mut tool_search_handle = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
         // MCP-origin ground truth for the tool_filter_groups gates; see
@@ -1071,6 +1236,22 @@ impl ScopedToolRegistry {
                             )
                         );
                     }
+                    // Tools advertised AFTER assembly
+                    // (notifications/tools/list_changed) must still reach the
+                    // model: keep a dynamic-sync handle the turn loop
+                    // reconciles before each iteration's spec build, mirroring
+                    // new names into the live activated set. Deferred mode
+                    // owns its own dynamic surface (tool_search stubs) and
+                    // skips this.
+                    mcp_dynamic_sync = Some(Arc::new(McpDynamicSync {
+                        registry: Arc::clone(&registry),
+                        security: Arc::clone(security),
+                        policy: mcp_policy,
+                        delegate_handle: delegate_handle.clone(),
+                        base_names: mcp_tool_names.clone(),
+                        owned: std::sync::Mutex::new(HashSet::new()),
+                        last_seen: std::sync::Mutex::new(None),
+                    }));
                 }
             }
         }
@@ -1330,7 +1511,11 @@ impl ScopedToolRegistry {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "seal", 7, 0);
         ScopedAssembled {
-            registry: ScopedToolRegistry(tools_registry.seal(pipeline_id), builtin_schema_handle),
+            registry: ScopedToolRegistry(
+                tools_registry.seal(pipeline_id),
+                builtin_schema_handle,
+                mcp_dynamic_sync,
+            ),
             delegate_handle,
             ask_user_handle,
             reaction_handle,
@@ -1354,6 +1539,66 @@ mod tests {
     use crate::tools::{ToolOutput, ToolResult};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn mcp_dynamic_sync_surfaces_and_retracts_mid_session_tools() {
+        let server = tools::McpRegistry::for_test_make_stub_server("kicad");
+        server.set_tools_for_test(&["stub_base"]).await;
+        let registry = Arc::new(tools::McpRegistry::for_test_with_server_handles(
+            vec![("kicad".to_string(), server.clone())],
+        ));
+        // Prime the index the way assembly's first read does; the result is
+        // the sealed registry's base set.
+        let base_names: HashSet<String> = registry
+            .refreshed_tool_names()
+            .await
+            .into_iter()
+            .collect();
+        assert_eq!(
+            base_names,
+            ["kicad__stub_base"]
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<_>>()
+        );
+
+        let sync = McpDynamicSync {
+            registry,
+            security: Arc::new(SecurityPolicy::default()),
+            policy: None,
+            delegate_handle: None,
+            base_names,
+            owned: std::sync::Mutex::new(HashSet::new()),
+            last_seen: std::sync::Mutex::new(None),
+        };
+        let activated = Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
+
+        // First pass primes the snapshot; the base tool is already sealed,
+        // so activating it would only duplicate its spec.
+        assert_eq!(sync.sync(&activated).await, 0);
+        assert!(!activated.lock().unwrap().is_activated("kicad__stub_base"));
+
+        // The server advertises a new tool mid-session
+        // (notifications/tools/list_changed after load_toolset).
+        server.set_tools_for_test(&["stub_base", "stub_new"]).await;
+        assert_eq!(sync.sync(&activated).await, 1);
+        {
+            let guard = activated.lock().unwrap();
+            assert!(guard.is_activated("kicad__stub_new"));
+            assert!(guard
+                .tool_specs()
+                .iter()
+                .any(|spec| spec.name == "kicad__stub_new"));
+        }
+
+        // No further change: cache-stable no-op.
+        assert_eq!(sync.sync(&activated).await, 0);
+
+        // The server retracts the tool (unload_toolset).
+        server.set_tools_for_test(&["stub_base"]).await;
+        assert_eq!(sync.sync(&activated).await, 1);
+        assert!(!activated.lock().unwrap().is_activated("kicad__stub_new"));
+    }
 
     struct MockTool(&'static str);
 
@@ -2622,7 +2867,7 @@ mod tests {
 
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
-            registry: ScopedToolRegistry(Vec::new(), None),
+            registry: ScopedToolRegistry(Vec::new(), None, None),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

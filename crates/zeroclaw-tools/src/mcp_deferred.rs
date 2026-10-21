@@ -280,6 +280,14 @@ impl ActivatedToolSet {
         self.tools.insert(name, tool);
     }
 
+    /// Withdraw a previously activated tool — e.g. its server retracted it
+    /// via `notifications/tools/list_changed` after `unload_toolset`.
+    /// Returns the executable so a caller that also tracks it in a delegate
+    /// set can withdraw it there too.
+    pub fn deactivate(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.remove(name)
+    }
+
     pub fn is_activated(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
