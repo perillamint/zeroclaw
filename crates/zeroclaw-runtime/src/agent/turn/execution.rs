@@ -213,10 +213,10 @@ pub struct ResolvedAgentExecution<'a> {
     pub security: Option<&'a SecurityPolicy>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
-    /// Full config, for resolving the configured `vision_model_provider`'s
-    /// alias-specific runtime options (the `vision` override, endpoint URI,
-    /// credentials) on the vision route. `None` on configless (test) paths,
-    /// where the route falls back to the legacy factory.
+    /// Admitted config for resolving alias-specific runtime policy (including
+    /// per-iteration MCP filter groups) and the configured vision provider's
+    /// options. `None` on configless paths, which have no configured MCP groups
+    /// and use the legacy vision factory.
     pub config: Option<&'a zeroclaw_config::schema::Config>,
     /// Agentic loop iteration cap.
     pub max_tool_iterations: usize,
@@ -266,8 +266,8 @@ pub struct ResolvedIo<'a> {
     /// configless (test) paths. See [`ResolvedAgentExecution::security`].
     pub security: Option<&'a SecurityPolicy>,
     pub multimodal_config: &'a MultimodalConfig,
-    /// Full config for vision-route provider-alias resolution; `None` on
-    /// configless (test) paths. See [`ResolvedAgentExecution::config`].
+    /// Admitted config for runtime-policy and vision-route alias resolution;
+    /// `None` on configless paths. See [`ResolvedAgentExecution::config`].
     pub config: Option<&'a zeroclaw_config::schema::Config>,
     pub hooks: Option<&'a HookRunner>,
     pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,

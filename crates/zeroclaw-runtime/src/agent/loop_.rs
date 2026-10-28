@@ -612,7 +612,7 @@ pub fn filter_tool_specs_for_turn(
         .collect()
 }
 
-fn mcp_tool_included_for_turn(
+pub(crate) fn mcp_tool_included_for_turn(
     name: &str,
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     msg_lower: &str,
@@ -9226,6 +9226,335 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OfferedToolsRecorder"
+        }
+    }
+
+    /// Simulates a server refresh, or tool_search activation in deferred mode.
+    struct FilterTestLoader {
+        server: Option<crate::tools::McpServer>,
+        activated: Arc<Mutex<crate::tools::ActivatedToolSet>>,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(FilterTestLoader);
+
+    #[async_trait]
+    impl Tool for FilterTestLoader {
+        fn name(&self) -> &str {
+            "tool_search"
+        }
+        fn description(&self) -> &str {
+            "Load test MCP tools"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(server) = &self.server {
+                server.set_tools_for_test(&["base", "get_board_info"]).await;
+            } else {
+                self.activated.lock().unwrap().activate(
+                    "pcb__get_board_info".into(),
+                    Arc::new(CountingTool::new(
+                        "pcb__get_board_info",
+                        Arc::clone(&self.invocations),
+                    )),
+                );
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                // A keyword in tool output must not admit the tool.
+                output: "PCB tools loaded".into(),
+                error: None,
+            })
+        }
+    }
+
+    async fn check_mid_turn_mcp_filter(
+        eager: bool,
+        has_groups: bool,
+        keyword: bool,
+        parallel: bool,
+        same_batch: bool,
+    ) {
+        use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, McpBundleConfig, McpServerConfig, McpTransport,
+            RuntimeProfileConfig, ToolFilterGroup, ToolFilterGroupMode,
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: workspace.path().join("config.toml"),
+            data_dir: workspace.path().join("data"),
+            ..Config::default()
+        };
+        config.runtime_profiles.insert(
+            "filtered".into(),
+            RuntimeProfileConfig {
+                tool_filter_groups: if has_groups {
+                    vec![ToolFilterGroup {
+                        mode: ToolFilterGroupMode::Dynamic,
+                        tools: vec!["pcb__*".into()],
+                        keywords: vec!["pcb".into()],
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                runtime_profile: "filtered".into(),
+                mcp_bundles: vec!["board".into()],
+                ..Default::default()
+            },
+        );
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let ordinary_calls = Arc::new(AtomicUsize::new(0));
+        let security = Arc::new(crate::security::SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        });
+        let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        // Keep the HTTP server alive for all eager MCP dispatches. No real
+        // config, provider, MCP service, or user's home is used by this fixture.
+        let http = MockServer::start().await;
+        let counted = Arc::clone(&invocations);
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"capabilities":{"tools":{}}}),
+                    "notifications/initialized" => return ResponseTemplate::new(202),
+                    "tools/list" => serde_json::json!({"tools":[{
+                        "name":"base", "description":"Base", "inputSchema":{"type":"object"}
+                    }]}),
+                    "tools/call" => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        serde_json::json!({"content":[{"type":"text","text":"board-read-ok"}]})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "filter-test")
+                    .set_body_json(
+                        serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}),
+                    )
+            })
+            .mount(&http)
+            .await;
+        config.mcp.enabled = eager;
+        config.mcp.deferred_loading = false;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "pcb".into(),
+            transport: McpTransport::Http,
+            url: Some(http.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "board".into(),
+            McpBundleConfig {
+                servers: vec!["pcb".into()],
+                exclude: Vec::new(),
+            },
+        );
+        let mcp = Arc::new(
+            crate::tools::McpRegistry::connect_all(if eager { &config.mcp.servers } else { &[] })
+                .await
+                .unwrap(),
+        );
+        let server = mcp
+            .server_handles()
+            .into_iter()
+            .next()
+            .map(|(_, server)| server);
+        let built = crate::tools::AllToolsResult::from_prebuilt_tools(vec![
+            Box::new(FilterTestLoader {
+                server,
+                activated: Arc::clone(&activated),
+                invocations: Arc::clone(&invocations),
+            }),
+            Box::new(CountingTool::new(
+                "pdf_skill__extract",
+                Arc::clone(&ordinary_calls),
+            )),
+            Box::new(CountingTool::new("ordinary", Arc::clone(&ordinary_calls))),
+        ]);
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "test-agent",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: eager,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: true,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: Some(mcp),
+        })
+        .await;
+        let activated = if eager {
+            assembled
+                .activated_handle
+                .as_ref()
+                .expect("production eager activation handle")
+        } else {
+            &activated
+        };
+        let call = |name: &str| ToolCall {
+            id: name.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        };
+        let response = |tool_calls| ChatResponse {
+            text: None,
+            tool_calls,
+            usage: None,
+            reasoning_content: None,
+        };
+        // The short alias exercises the executor's post-resolution exclusion
+        // too; filtering just the requested spelling is insufficient.
+        let mut calls = vec![
+            call("get_board_info"),
+            call("pdf_skill__extract"),
+            call("ordinary"),
+        ];
+        let mut responses = Vec::new();
+        if same_batch {
+            calls.insert(0, call("tool_search"));
+        } else {
+            responses.push(response(vec![call("tool_search")]));
+        }
+        responses.push(response(calls));
+        responses.push(ChatResponse {
+            text: Some("done".into()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        });
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let provider = OfferedToolsRecorder {
+            responses: Arc::new(Mutex::new(responses.into())),
+            offered: Arc::clone(&offered),
+        };
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(if keyword {
+                "inspect the PCB"
+            } else {
+                "load tools"
+            }),
+        ];
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &assembled.registry,
+                observer: &NoopObserver,
+                silent: true,
+                approval: None,
+                security: Some(&security),
+                multimodal_config: &Default::default(),
+                config: Some(&config),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: Some(activated),
+                model_switch_callback: None,
+                pacing: &Default::default(),
+                strict_tool_parsing: false,
+                parallel_tools: parallel,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("test-agent"),
+            turn_id: "mid-turn-mcp-filter",
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "done");
+        let allowed = !has_groups || keyword;
+        assert_eq!(invocations.load(Ordering::SeqCst), usize::from(allowed));
+        assert_eq!(
+            ordinary_calls.load(Ordering::SeqCst),
+            2,
+            "non-MCP names must remain callable"
+        );
+        let offered = offered.lock().unwrap();
+        assert!(!offered[0].iter().any(|name| name == "pcb__get_board_info"));
+        assert!(offered[1].iter().any(|name| name == "pdf_skill__extract"));
+        assert_eq!(
+            offered[1].iter().any(|name| name == "pcb__get_board_info"),
+            allowed
+        );
+        if !allowed {
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains("Tool not available in this turn")),
+                "must reach dispatch denial, not just hide the schema: {history:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_turn_mcp_filter_eager_refresh_visibility_and_execution() {
+        for parallel in [false, true] {
+            for (groups, keyword) in [(true, false), (true, true), (false, false)] {
+                check_mid_turn_mcp_filter(true, groups, keyword, parallel, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_turn_mcp_filter_deferred_activation_visibility_and_execution() {
+        for same_batch in [false, true] {
+            for parallel in [false, true] {
+                for keyword in [false, true] {
+                    check_mid_turn_mcp_filter(false, true, keyword, parallel, same_batch).await;
+                }
+            }
         }
     }
 

@@ -358,9 +358,29 @@ impl ScopedToolRegistry {
         activated: &Arc<std::sync::Mutex<ActivatedToolSet>>,
     ) -> usize {
         match &self.2 {
-            Some(sync) => sync.sync(activated).await,
+            Some(sync) => sync.sync(activated, &self.0).await,
             None => 0,
         }
+    }
+
+    /// Resolve MCP origin without letting server advertisements claim skill names.
+    pub async fn current_mcp_tool_names(&self) -> HashSet<String> {
+        let Some(sync) = &self.2 else {
+            return HashSet::new();
+        };
+        let mut names: HashSet<String> = sync
+            .registry
+            .refreshed_tool_names()
+            .await
+            .into_iter()
+            .filter(|name| {
+                sync.base_names.contains(name) || !self.0.iter().any(|tool| tool.name() == name)
+            })
+            .collect();
+        // Sealed base wrappers survive server withdrawal, so their origin must
+        // survive too; otherwise an unloaded tool would evade turn filtering.
+        names.extend(sync.base_names.iter().cloned());
+        names
     }
 
     /// Keep future MCP activations inside a principal ceiling tightened after
@@ -592,17 +612,16 @@ fn tool_allowed_in_context(name: &str, exclude_memory: bool, acp_delivery: bool)
 /// exposes them from the very next model call, in the same turn.
 ///
 /// Semantics:
-/// - A newly advertised name is activated only when the policy admits it and
-///   it is not already in the sealed registry's base set (activating a base
-///   name would duplicate its spec in every iteration).
+/// - New names are activated only when policy admits them. Changed definitions
+///   replace owned activations; a changed base definition overlays its sealed
+///   schema without changing the original dispatch route.
 /// - A name this sync activated that the server no longer advertises is
 ///   withdrawn again. Base-registered names that vanish stay in the sealed
 ///   registry until the next session: the activated set cannot withdraw from
-///   the base Vec. Documented limitation, acceptable for `unload_toolset`.
-/// - Each pass is gated by a `last_seen` name snapshot: with no registry
-///   change the tools array stays byte-identical, so provider prompt caches
-///   survive. A real change breaks the cache exactly once, which is the
-///   intended semantic of surfacing new tools.
+///   the base Vec. Their latest schema overlays follow that same lifetime.
+/// - Definitions are compared with the currently published wrappers, not a
+///   second name-only cache. Unchanged schemas keep their Arc allocation and
+///   deterministic request bytes, while same-name schema updates are visible.
 pub(crate) struct McpDynamicSync {
     registry: Arc<tools::McpRegistry>,
     security: Arc<SecurityPolicy>,
@@ -612,42 +631,43 @@ pub(crate) struct McpDynamicSync {
     base_names: HashSet<String>,
     /// Prefixed names this sync activated (and owns withdrawal for).
     owned: std::sync::Mutex<HashSet<String>>,
-    /// Last registry name snapshot; unchanged means no-op.
-    last_seen: std::sync::Mutex<Option<HashSet<String>>>,
 }
 
 impl McpDynamicSync {
-    /// Reconcile `activated` with the registry's current tool list. Returns
-    /// the number of tools added or withdrawn. Never fails: a registry error
-    /// degrades to a no-op pass, leaving the previous surface intact.
-    pub(crate) async fn sync(&self, activated: &Arc<std::sync::Mutex<ActivatedToolSet>>) -> usize {
+    /// Reconcile definitions against the published surface. Returns the number
+    /// of added, updated or withdrawn wrappers. Missing definitions are retried
+    /// next iteration rather than marked as synchronized.
+    pub(crate) async fn sync(
+        &self,
+        activated: &Arc<std::sync::Mutex<ActivatedToolSet>>,
+        base_tools: &[Box<dyn Tool>],
+    ) -> usize {
         let names: HashSet<String> = self
             .registry
             .refreshed_tool_names()
             .await
             .into_iter()
             .collect();
-        // Prompt-cache gate: byte-identical tool arrays across turns unless
-        // the registry actually changed.
-        {
-            let last_seen = self.last_seen.lock().unwrap_or_else(|e| e.into_inner());
-            if last_seen.as_ref() == Some(&names) {
-                return 0;
-            }
-        }
-        *self.last_seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(names.clone());
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut changed = 0usize;
-        // Withdrawals first: names this sync owns that the server no longer
-        // advertises.
-        let vanished: Vec<String> = {
-            let owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
-            owned
-                .iter()
-                .filter(|name| !names.contains(*name))
-                .cloned()
-                .collect()
-        };
-        for name in &vanished {
+        let withdrawn: Vec<String> = self
+            .owned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|name| {
+                let base = self.base_names.contains(*name);
+                (!names.contains(*name) && !base)
+                    || !eager_mcp_tool_allowed(name, policy.as_ref())
+                    || (base && !base_tools.iter().any(|tool| tool.name() == name.as_str()))
+            })
+            .cloned()
+            .collect();
+        for name in &withdrawn {
             activated
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -661,31 +681,47 @@ impl McpDynamicSync {
                 .remove(name);
             changed += 1;
         }
-        // Additions: advertised since assembly, policy-admitted, neither in
-        // the base set nor already activated (a duplicate spec is a provider
-        // error, not a display quirk).
         for name in names {
-            if self.base_names.contains(&name) {
+            if !eager_mcp_tool_allowed(&name, policy.as_ref()) {
                 continue;
             }
-            if !eager_mcp_tool_allowed(
-                &name,
-                self.policy
+            let current = activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&name);
+            // Only replace activations we own. Other activation owners keep
+            // their admission boundary and registration semantics.
+            if current.is_some()
+                && !self
+                    .owned
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .as_ref(),
-            ) {
+                    .contains(&name)
+            {
                 continue;
             }
-            {
-                let guard = activated.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.is_activated(&name) {
-                    continue;
-                }
+            let base = base_tools.iter().find(|tool| tool.name() == name);
+            if self.base_names.contains(&name) && base.is_none() {
+                // A post-assembly scope removed this base tool; never revive it.
+                continue;
+            }
+            if !self.base_names.contains(&name) && base.is_some() {
+                // A built-in or skill owns this name, not the MCP server.
+                continue;
             }
             let Some(def) = self.registry.get_tool_def(&name).await else {
                 continue;
             };
+            let old_spec = current
+                .as_ref()
+                .map(|tool| tool.spec())
+                .or_else(|| base.map(|tool| tool.spec()));
+            if old_spec.as_ref().is_some_and(|spec| {
+                spec.description == def.description.as_deref().unwrap_or("MCP tool")
+                    && *spec.parameters == def.input_schema
+            }) {
+                continue;
+            }
             let wrapper: Arc<dyn Tool> = Arc::new(tools::McpToolWrapper::new(
                 name.clone(),
                 def,
@@ -698,10 +734,9 @@ impl McpDynamicSync {
                 .activate(name.clone(), Arc::clone(&wrapper));
             if let Some(handle) = &self.delegate_handle {
                 let mut delegate_tools = handle.write();
-                if !delegate_tools
-                    .iter()
-                    .any(|tool| tool.name() == wrapper.name())
-                {
+                if let Some(existing) = delegate_tools.iter_mut().find(|tool| tool.name() == name) {
+                    *existing = wrapper;
+                } else {
                     delegate_tools.push(wrapper);
                 }
             }
@@ -716,10 +751,10 @@ impl McpDynamicSync {
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
                     .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_attrs(::serde_json::json!({
-                        "changed": changed,
-                    })),
-                &format!("MCP dynamic sync: {changed} tool(s) added or withdrawn mid-session")
+                    .with_attrs(::serde_json::json!({"changed": changed})),
+                &format!(
+                    "MCP dynamic sync: {changed} tool(s) added, updated or withdrawn mid-session"
+                )
             );
         }
         changed
@@ -1283,7 +1318,6 @@ impl ScopedToolRegistry {
                             // snapshot: notifications can land during assembly.
                             base_names,
                             owned: std::sync::Mutex::new(HashSet::new()),
-                            last_seen: std::sync::Mutex::new(None),
                         }));
                     }
                 }
@@ -1601,19 +1635,18 @@ mod tests {
             delegate_handle: None,
             base_names,
             owned: std::sync::Mutex::new(HashSet::new()),
-            last_seen: std::sync::Mutex::new(None),
         };
         let activated = Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
 
         // First pass primes the snapshot; the base tool is already sealed,
         // so activating it would only duplicate its spec.
-        assert_eq!(sync.sync(&activated).await, 0);
+        assert_eq!(sync.sync(&activated, &[]).await, 0);
         assert!(!activated.lock().unwrap().is_activated("kicad__stub_base"));
 
         // The server advertises a new tool mid-session
         // (notifications/tools/list_changed after load_toolset).
         server.set_tools_for_test(&["stub_base", "stub_new"]).await;
-        assert_eq!(sync.sync(&activated).await, 1);
+        assert_eq!(sync.sync(&activated, &[]).await, 1);
         {
             let guard = activated.lock().unwrap();
             assert!(guard.is_activated("kicad__stub_new"));
@@ -1626,11 +1659,11 @@ mod tests {
         }
 
         // No further change: cache-stable no-op.
-        assert_eq!(sync.sync(&activated).await, 0);
+        assert_eq!(sync.sync(&activated, &[]).await, 0);
 
         // The server retracts the tool (unload_toolset).
         server.set_tools_for_test(&["stub_base"]).await;
-        assert_eq!(sync.sync(&activated).await, 1);
+        assert_eq!(sync.sync(&activated, &[]).await, 1);
         assert!(!activated.lock().unwrap().is_activated("kicad__stub_new"));
     }
 
@@ -1698,6 +1731,162 @@ mod tests {
             mcp_registry: Some(registry),
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_refreshes_same_name_definitions_without_duplicate_schemas() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, config, registry, handle) = dynamic_mcp_fixture(false).await;
+        let security = Arc::new(SecurityPolicy::default());
+        let parent = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let mut built = built_with(Vec::new());
+        built.delegate_handle = Some(Arc::clone(&parent));
+        let assembled =
+            assemble_dynamic_mcp(&config, registry, &security, built, None, false).await;
+        let activated = assembled.activated_handle.as_ref().unwrap();
+        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 0);
+        let provider = CaptureMcpTools(Arc::new(std::sync::Mutex::new(Vec::new())), false);
+        let mut previous_bytes = Vec::new();
+        for version in 1..=2 {
+            let schema = serde_json::json!({
+                "type":"object", "properties": {"revision": {"const": version}},
+                "required":["revision"]
+            });
+            server.reset().await;
+            let advertised = serde_json::json!({"tools":[
+                {"name":"base", "description":format!("base v{version}"), "inputSchema":schema},
+                {"name":"added", "description":format!("added v{version}"), "inputSchema":schema}
+            ]});
+            Mock::given(method("POST"))
+                .and(body_partial_json(
+                    serde_json::json!({"method":"tools/list"}),
+                ))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc":"2.0", "id":body["id"], "result":advertised
+                    }))
+                })
+                .mount(&server)
+                .await;
+            handle.refresh_tools().await.unwrap();
+            assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 2);
+            let build = || {
+                crate::agent::turn::build_iteration_tool_specs(
+                    &provider,
+                    "test",
+                    &assembled.registry,
+                    &[],
+                    Some(activated),
+                )
+                .unwrap()
+            };
+            let specs = build().tool_specs;
+            for name in ["kicad__base", "kicad__added"] {
+                let matches: Vec<_> = specs.iter().filter(|spec| spec.name == name).collect();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "base schema must be overlaid, not duplicated"
+                );
+                assert_eq!(*matches[0].parameters, schema);
+                assert!(matches[0].description.ends_with(&format!("v{version}")));
+                let delegated = parent.read();
+                let delegated: Vec<_> = delegated
+                    .iter()
+                    .filter(|tool| tool.name() == name)
+                    .collect();
+                assert_eq!(delegated.len(), 1);
+                assert_eq!(*delegated[0].spec().parameters, schema);
+            }
+            let bytes = serde_json::to_vec(&specs).unwrap();
+            assert_ne!(previous_bytes, bytes);
+            assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 0);
+            // Even a redundant notification must keep request bytes and schema
+            // allocations unchanged when the definition itself did not change.
+            handle.refresh_tools().await.unwrap();
+            assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 0);
+            let unchanged = build().tool_specs;
+            assert_eq!(bytes, serde_json::to_vec(&unchanged).unwrap());
+            for (before, after) in specs.iter().zip(&unchanged) {
+                if before.name.starts_with("kicad__") {
+                    assert!(Arc::ptr_eq(&before.parameters, &after.parameters));
+                }
+            }
+            previous_bytes = bytes;
+        }
+        // Base overlays retain the existing base-wrapper unload lifetime. A
+        // reversion to the original schema must still reach bounded delegates.
+        handle.set_tools_for_test(&[]).await;
+        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 1);
+        assert!(
+            assembled
+                .registry
+                .current_mcp_tool_names()
+                .await
+                .contains("kicad__base")
+        );
+        assert!(
+            parent
+                .read()
+                .iter()
+                .any(|tool| tool.name() == "kicad__base")
+        );
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method":"tools/list"}),
+            ))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0", "id":body["id"], "result":{"tools":[
+                        {"name":"base", "description":"Base tool", "inputSchema":{"type":"object"}}
+                    ]}
+                }))
+            })
+            .mount(&server)
+            .await;
+        handle.refresh_tools().await.unwrap();
+        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 1);
+        let delegated = parent.read();
+        let base = delegated
+            .iter()
+            .find(|tool| tool.name() == "kicad__base")
+            .unwrap();
+        assert_eq!(base.description(), "Base tool");
+        assert_eq!(
+            *base.spec().parameters,
+            serde_json::json!({"type":"object"})
+        );
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_advertisement_cannot_claim_existing_skill_name() {
+        let (_server, config, registry, handle) = dynamic_mcp_fixture(false).await;
+        let security = Arc::new(SecurityPolicy::default());
+        let assembled = assemble_dynamic_mcp(
+            &config,
+            registry,
+            &security,
+            built_with(vec![Box::new(MockTool("kicad__skill"))]),
+            None,
+            false,
+        )
+        .await;
+        handle.set_tools_for_test(&["base", "skill"]).await;
+        let activated = assembled.activated_handle.as_ref().unwrap();
+        assembled.registry.sync_dynamic_mcp(activated).await;
+        assert!(!activated.lock().unwrap().is_activated("kicad__skill"));
+        assert!(
+            !assembled
+                .registry
+                .current_mcp_tool_names()
+                .await
+                .contains("kicad__skill")
+        );
     }
 
     /// Simulate a tools/list refresh having landed during a tool round. The
@@ -1877,7 +2066,7 @@ mod tests {
             .unwrap();
         assert_eq!(agent.turn("load and read").await.unwrap(), "done");
         assert_eq!(requests.lock().unwrap().len(), 3);
-        // No list change at the boundary: last_seen skips reconciliation, so
+        // No list change at the boundary: the published wrappers stay intact, so
         // the assembly-owned activation state must survive and execute again.
         assert_eq!(agent.turn("read again, then unload").await.unwrap(), "done");
         let requests = requests.lock().unwrap();
@@ -2171,7 +2360,8 @@ mod tests {
                 .contains("calendar")
         );
         handle.set_tools_for_test(&["base", "get_board_info"]).await;
-        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 1);
+        // The fixture also changes base's description/schema to the test default.
+        assert_eq!(assembled.registry.sync_dynamic_mcp(activated).await, 2);
         assembled
             .tool_search_handle
             .as_ref()

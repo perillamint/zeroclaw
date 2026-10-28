@@ -1659,6 +1659,7 @@ impl McpRegistry {
         let dead_set: std::collections::HashSet<_> = dead.iter().cloned().collect();
 
         let mut new_servers = Vec::with_capacity(self.servers.len());
+        let mut new_indexed_generations = Vec::with_capacity(self.servers.len());
         let mut new_server_index = HashMap::with_capacity(self.server_index.len());
         let mut old_to_new_idx = HashMap::with_capacity(self.server_index.len());
 
@@ -1668,6 +1669,9 @@ impl McpRegistry {
             }
             let new_idx = new_servers.len();
             new_servers.push(self.servers[old_idx].clone());
+            // Remapping old index entries must not mark a pending tool-list
+            // refresh as indexed. Carry the generation from the same old slot.
+            new_indexed_generations.push(self.indexed_generations.get_mut()[old_idx]);
             old_to_new_idx.insert(old_idx, new_idx);
             new_server_index.insert(name.clone(), new_idx);
         }
@@ -1685,18 +1689,7 @@ impl McpRegistry {
         self.servers = new_servers;
         self.server_index = new_server_index;
         *self.tool_index.write() = new_tool_index;
-        // Re-derive the per-server generation bookkeeping from the surviving
-        // handles so `indexed_generations` stays aligned with `servers` (the
-        // HashMap iteration order above is arbitrary; positions must not be
-        // guessed). Surviving handles kept their tool lists, so their live
-        // generations are exactly what the freshly remapped index reflects.
-        {
-            let mut new_generations = Vec::with_capacity(self.servers.len());
-            for server in &self.servers {
-                new_generations.push(server.inner.lock().await.tools_generation);
-            }
-            *self.indexed_generations.get_mut() = new_generations;
-        }
+        *self.indexed_generations.get_mut() = new_indexed_generations;
 
         dead
     }
@@ -2193,6 +2186,107 @@ mod tests {
             serial_gate: None,
             recovery: Arc::new(RecoveryBarrier::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn pruning_dead_peer_preserves_pending_tool_refresh_and_generation_remap() {
+        struct DeadTransport;
+
+        #[async_trait::async_trait]
+        impl SharedMcpTransportConn for DeadTransport {
+            async fn send_and_recv(
+                &self,
+                _request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+                unreachable!("dead peer must not receive requests")
+            }
+
+            fn health_check(&self) -> bool {
+                false
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let dead = server_with_transport("dead", Arc::new(DeadTransport), 5);
+        dead.set_tools_for_test(&["gone"]).await;
+        let steady =
+            server_with_transport("steady", Arc::new(FakeTransport { result: json!({}) }), 5);
+        steady.set_tools_for_test(&["unchanged"]).await;
+        let updated_schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let refreshed_tools = json!({"tools": [
+            {"name": "kept", "description": "updated tool", "inputSchema": updated_schema},
+            {"name": "added", "inputSchema": {"type": "object"}}
+        ]});
+        let changing = server_with_transport(
+            "changing",
+            Arc::new(FakeTransport {
+                result: refreshed_tools.clone(),
+            }),
+            5,
+        );
+        changing.set_tools_for_test(&["removed"]).await;
+        changing.set_tools_for_test(&["kept", "removed"]).await;
+        let mut registry =
+            McpRegistry::from_servers(vec![dead, steady.clone(), changing.clone()]).await;
+        assert_eq!(*registry.indexed_generations.lock(), vec![1, 1, 2]);
+        assert_eq!(registry.server_index["changing"], 2);
+
+        // Land the same refresh a list_changed listener performs, without
+        // letting the registry index it before the dead peer is pruned.
+        changing.refresh_tools().await.expect("refresh survivor");
+        assert_eq!(changing.inner.lock().await.tools_generation, 3);
+        assert!(registry.tool_names().contains(&"changing__removed".into()));
+
+        assert_eq!(registry.kill_dead_connections().await, vec!["dead"]);
+        assert_eq!(registry.server_count(), 2);
+        assert!(registry.health_check_all().is_empty());
+        // The last original server must move regardless of HashMap order.
+        let changing_idx = registry.server_index["changing"];
+        let steady_idx = registry.server_index["steady"];
+        assert!(changing_idx < 2);
+        assert!(registry.servers[changing_idx].ptr_eq(&changing));
+        assert!(registry.servers[steady_idx].ptr_eq(&steady));
+        let indexed_before_refresh = registry.indexed_generations.lock().clone();
+
+        let mut names = registry.refreshed_tool_names().await;
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["changing__added", "changing__kept", "steady__unchanged"]
+        );
+        assert_eq!(indexed_before_refresh[changing_idx], 2);
+        assert_eq!(indexed_before_refresh[steady_idx], 1);
+        assert_eq!(registry.indexed_generations.lock()[changing_idx], 3);
+        assert_eq!(registry.indexed_generations.lock()[steady_idx], 1);
+        assert_eq!(registry.tool_count(), 3);
+        assert!(registry.get_tool_def("dead__gone").await.is_none());
+        assert!(registry.get_tool_def("changing__removed").await.is_none());
+        assert!(registry.get_tool_def("steady__unchanged").await.is_some());
+        let def = registry
+            .get_tool_def("changing__kept")
+            .await
+            .expect("updated survivor definition");
+        assert_eq!(def.description.as_deref(), Some("updated tool"));
+        assert_eq!(def.input_schema, updated_schema);
+        assert_eq!(
+            registry
+                .call_tool("changing__added", json!({}))
+                .await
+                .expect("new tool routes to remapped survivor"),
+            refreshed_tools
+        );
+        assert!(registry.kill_dead_connections().await.is_empty());
+        let mut unchanged_names = registry.refreshed_tool_names().await;
+        unchanged_names.sort();
+        assert_eq!(unchanged_names, names);
     }
 
     struct PreWriteBlockingTransport {

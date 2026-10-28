@@ -67,6 +67,40 @@ pub(super) fn exceeds_single_tool_round(
         && zeroclaw_tool_call_parser::parse_tool_calls(&text).1.len() > 1
 }
 
+/// Resolve turn filtering from the current MCP owners, not name syntax or the
+/// original sealed registry. The activation map owns only MCP executables;
+/// deferred built-in schemas live in a separate metadata map.
+pub(super) async fn excluded_mcp_tools_for_iteration(
+    tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+    activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
+    groups: &[zeroclaw_config::schema::ToolFilterGroup],
+    user_message: &str,
+) -> Vec<String> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let mut names = tools_registry.current_mcp_tool_names().await;
+    // These reserved host names are the generic MCP capability wrappers,
+    // minted only by scoped MCP assembly (never skill-owned names).
+    names.extend(
+        tools_registry
+            .iter()
+            .filter(|tool| matches!(tool.name(), "mcp_resources" | "mcp_prompts"))
+            .map(|tool| tool.name().to_owned()),
+    );
+    if let Some(activated) = activated_tools {
+        let activated = activated.lock().unwrap_or_else(|error| error.into_inner());
+        names.extend(activated.tool_names().into_iter().map(str::to_owned));
+    }
+    let message = user_message.to_ascii_lowercase();
+    let mut excluded: Vec<_> = names
+        .into_iter()
+        .filter(|name| !crate::agent::loop_::mcp_tool_included_for_turn(name, groups, &message))
+        .collect();
+    excluded.sort_unstable();
+    excluded
+}
+
 pub(crate) fn build_iteration_tool_specs(
     model_provider: &dyn ModelProvider,
     model: &str,
@@ -101,7 +135,13 @@ pub(crate) fn build_iteration_tool_specs(
         }
         for spec in activated_tools.tool_specs() {
             if !excluded_tools.iter().any(|ex| ex == &spec.name) {
-                tool_specs.push(spec);
+                // Eager MCP definition updates overlay a sealed base schema.
+                // Keep a single provider definition, with the refreshed schema.
+                if let Some(base) = tool_specs.iter_mut().find(|base| base.name == spec.name) {
+                    *base = spec;
+                } else {
+                    tool_specs.push(spec);
+                }
             }
         }
     }
@@ -269,6 +309,42 @@ mod tests {
         fn alias(&self) -> &str {
             self.name()
         }
+    }
+
+    #[test]
+    fn mid_turn_mcp_filter_message_ignores_tool_carriers_memory_and_trim_breadcrumbs() {
+        use crate::agent::turn::{MemoryPreamble, current_filter_user_message};
+        use zeroclaw_providers::ChatMessage;
+
+        let injected = MemoryPreamble {
+            preamble: "recalled PCB context\n".into(),
+            index: 3,
+        };
+        let history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("PCB breadcrumb"),
+            ChatMessage::user("old PCB request"),
+            ChatMessage::user("recalled PCB context\ncurrent request"),
+            ChatMessage::assistant("PCB narration"),
+            ChatMessage::user("[Tool results]\nPCB tool output"),
+        ];
+        assert_eq!(
+            current_filter_user_message(&history, true, Some(&injected)),
+            "current request"
+        );
+        assert_eq!(current_filter_user_message(&history[..2], true, None), "");
+        assert_eq!(
+            current_filter_user_message(&history[..2], false, None),
+            "PCB breadcrumb"
+        );
+        // The streamed owner may admit steering before the first model round;
+        // filtering follows that input rather than the original ingress text.
+        let mut steered = history;
+        steered.push(ChatMessage::user("inspect PCB"));
+        assert_eq!(
+            current_filter_user_message(&steered, true, Some(&injected)),
+            "inspect PCB"
+        );
     }
 
     #[test]

@@ -3034,9 +3034,9 @@ impl Agent {
             channel_room_handle,
             activated_handle,
             tool_search_handle,
-            // from_config performs no per-turn tool_filter_groups filtering
-            // itself, so mcp_tool_names is dropped here along with `registry`'s
-            // already-consumed sibling fields via `..`.
+            // The turn engine resolves filter groups against current MCP
+            // origins rather than retaining this assembly-time name snapshot.
+            // Drop it with the already-consumed sibling fields via `..`.
             ..
         } = assembled;
         // Nested delegation has no principal-agent ceiling parameter yet. A

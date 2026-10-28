@@ -110,6 +110,41 @@ pub struct MemoryPreamble {
     pub index: usize,
 }
 
+/// The current user turn, not a prompt-mode tool-result carrier, synthetic
+/// trim breadcrumb, or the memory preamble injected onto that turn. Steering
+/// admitted into history becomes the current message on the next iteration.
+fn current_filter_user_message<'a>(
+    history: &'a [ChatMessage],
+    crumb_present: bool,
+    injected: Option<&MemoryPreamble>,
+) -> &'a str {
+    let crumb = crumb_present.then(|| {
+        history
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count()
+    });
+    history
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, message)| {
+            Some(*index) != crumb
+                && message.role == "user"
+                && !message
+                    .content
+                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
+        })
+        .map_or("", |(index, message)| {
+            crate::agent::memory_inject::strip_memory_context_preamble(
+                &message.content,
+                injected
+                    .filter(|target| target.index == index)
+                    .map(|target| target.preamble.as_str()),
+            )
+        })
+}
+
 fn retention_layout(history: &[ChatMessage], crumb: bool) -> (usize, usize, bool) {
     (
         history.len(),
@@ -1756,6 +1791,19 @@ async fn run_tool_call_loop_impl<'a>(
         }
     }
 
+    // Retain the admitted user input while this turn appends tool carriers and
+    // internal retry feedback to history. Neither is a new user keyword grant.
+    // This is message-local state, not a retained tool-policy snapshot.
+    // Initial ingress owns admission of the original request, not selection
+    // of the latest input: the streaming owner may already have appended
+    // admitted steering before round zero.
+    let mut filter_message = current_filter_user_message(
+        turn_state.history,
+        turn_state.crumb_present,
+        injected_memory_preamble.as_ref(),
+    )
+    .to_owned();
+
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -1885,31 +1933,6 @@ async fn run_tool_call_loop_impl<'a>(
         if let Some(activated) = activated_tools {
             tools_registry.sync_dynamic_mcp(activated).await;
         }
-        // Re-resolved every iteration, against the tools callable *right now*.
-        //
-        // A step's scope is resolved by name, so it can only narrow tools that
-        // exist when it runs: `tool_search` activates deferred MCP tools in the
-        // middle of a turn, and a scoped step must narrow those on the next
-        // iteration rather than the next turn — otherwise a step that may call
-        // `tool_search` can reach a tool its scope excludes. Reading the scope
-        // from the task (rather than a parameter) also covers the loops this
-        // one drives on behalf of another agent: a delegated target assembles
-        // its own registry, and inherits the boundary all the same.
-        //
-        // `None` for every ordinary turn, which keeps its own slice and pays
-        // nothing.
-        let step_scoped_excluded: Option<Vec<String>> =
-            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
-                let mut merged = excluded_tools.to_vec();
-                crate::agent::loop_::merge_sop_step_exclusions(
-                    &mut merged,
-                    tools_registry,
-                    activated_tools,
-                    Some(&scope),
-                );
-                merged
-            });
-        let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
 
         if knobs.yield_to_steering {
             // The caller judges steering; this loop only hands control back
@@ -1967,7 +1990,11 @@ async fn run_tool_call_loop_impl<'a>(
                     IngressDecision::Drop { .. } => continue,
                 }
                 let msg = ChatMessage::user(steering_input.into_text());
-                has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
+                let is_user_input = !msg.content.trim_start().starts_with("[Tool results]");
+                has_new_user_input |= is_user_input;
+                if is_user_input {
+                    filter_message.clone_from(&msg.content);
+                }
                 turn_state.push_dual(msg);
             }
         }
@@ -2107,6 +2134,34 @@ async fn run_tool_call_loop_impl<'a>(
             } else {
                 (model_provider, provider_name, model, dispatch_model)
             };
+
+        // Use the admitted config already carried by every configured entry
+        // point (including Agent::from_config), not a second policy snapshot.
+        let filter_groups = config
+            .zip(agent_alias)
+            .and_then(|(config, alias)| config.runtime_profile_for_agent(alias))
+            .map_or(&[][..], |profile| profile.tool_filter_groups.as_slice());
+        let mut iteration_excluded = excluded_tools.to_vec();
+        iteration_excluded.extend(
+            tool_specs::excluded_mcp_tools_for_iteration(
+                tools_registry,
+                activated_tools,
+                filter_groups,
+                &filter_message,
+            )
+            .await,
+        );
+        // Keep the SOP ceiling in the same view used for schema exposure and
+        // dispatch, after MCP synchronization and admitted steering.
+        if let Some(scope) = crate::sop::active_scope::active_headless_step_scope() {
+            crate::agent::loop_::merge_sop_step_exclusions(
+                &mut iteration_excluded,
+                tools_registry,
+                activated_tools,
+                Some(&scope),
+            );
+        }
+        let excluded_tools = iteration_excluded.as_slice();
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             active_model_provider,
@@ -3288,6 +3343,18 @@ async fn run_tool_call_loop_impl<'a>(
         )
         .await?;
 
+        let mut dispatch_excluded = excluded_tools.to_vec();
+        dispatch_excluded.extend(
+            tool_specs::excluded_mcp_tools_for_iteration(
+                tools_registry,
+                activated_tools,
+                filter_groups,
+                &filter_message,
+            )
+            .await,
+        );
+        let excluded_tools = dispatch_excluded.as_slice();
+
         // Hooks and preparation may rewrite tool names or arguments. Decide
         // parallel eligibility from the final executable calls so policy is
         // applied to what the runtime will actually dispatch.
@@ -3315,17 +3382,16 @@ async fn run_tool_call_loop_impl<'a>(
                         ctx.event_tx,
                     )
                     .await
-                } else {
+                } else if filter_groups.is_empty() {
                     let meta = ctx.meta();
-                    let dispatch = ToolDispatchContext {
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                        model_switch_callback: model_switch_callback.as_ref(),
-                    };
                     execute_tools_sequential(
                         &executable_calls,
-                        dispatch,
+                        ToolDispatchContext {
+                            tools_registry,
+                            activated_tools,
+                            excluded_tools,
+                            model_switch_callback: model_switch_callback.as_ref(),
+                        },
                         &meta,
                         observer,
                         cancellation_token.as_ref(),
@@ -3333,6 +3399,51 @@ async fn run_tool_call_loop_impl<'a>(
                         ctx.event_tx,
                     )
                     .await
+                } else {
+                    let meta = ctx.meta();
+                    let mut slots = Vec::with_capacity(executable_calls.len());
+                    for call in &executable_calls {
+                        // tool_search can activate a deferred MCP tool earlier
+                        // in this SAME response. Recheck before each dispatch,
+                        // preserving the executor's cancellation/result slots.
+                        let mut call_excluded = excluded_tools.to_vec();
+                        call_excluded.extend(
+                            tool_specs::excluded_mcp_tools_for_iteration(
+                                tools_registry,
+                                activated_tools,
+                                filter_groups,
+                                &filter_message,
+                            )
+                            .await,
+                        );
+                        let dispatch = ToolDispatchContext {
+                            tools_registry,
+                            activated_tools,
+                            excluded_tools: &call_excluded,
+                            model_switch_callback: model_switch_callback.as_ref(),
+                        };
+                        slots.extend(
+                            execute_tools_sequential(
+                                std::slice::from_ref(call),
+                                dispatch,
+                                &meta,
+                                observer,
+                                cancellation_token.as_ref(),
+                                receipt_generator,
+                                ctx.event_tx,
+                            )
+                            .await?,
+                        );
+                        if slots.last().is_some_and(Option::is_none)
+                            || cancellation_token
+                                .as_ref()
+                                .is_some_and(CancellationToken::is_cancelled)
+                        {
+                            break;
+                        }
+                    }
+                    slots.resize_with(executable_calls.len(), || None);
+                    Ok(slots)
                 }
             });
         let execution = scope_model_switch_provider_allowlist(
