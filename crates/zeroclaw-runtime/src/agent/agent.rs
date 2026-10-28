@@ -2439,6 +2439,48 @@ impl Agent {
         .await
     }
 
+    /// Build ACP route inputs from the caller's request snapshot (including any
+    /// connection override), retaining canonical live tool/history policy and
+    /// nested-execution admission through the same execution capability.
+    /// The snapshot is a construction generation, not a live policy authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_snapshot_with_mcp_backchannel_with_capability(
+        config: &Config,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Result<Self> {
+        let live_config = execution_capability
+            .as_ref()
+            .map(AgentExecutionCapability::config_handle);
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            acp_session_store,
+            live_config,
+            None,
+            None,
+            execution_capability,
+        )
+        .await
+    }
+
     /// Build a daemon-backed ACP/WS Agent whose model route generation is pinned
     /// until reconnect while independently live tool/history policy continues
     /// to follow the shared config.

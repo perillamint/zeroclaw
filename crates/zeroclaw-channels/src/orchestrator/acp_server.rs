@@ -358,7 +358,6 @@ impl AcpServer {
         *current = capabilities;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn build_agent(
         &self,
         config: &Config,
@@ -366,94 +365,33 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
         exclude_memory: bool,
-        connection_override_applied: bool,
     ) -> Result<Agent> {
-        // When a connection-scoped model override was applied to `config` by
-        // the caller, the live-config constructors would re-snapshot the
-        // shared live config and silently drop the override. Overridden
-        // sessions therefore always build from the caller's snapshot, which
-        // pins their whole config view for the session lifetime — the same
-        // semantics a standalone `zeroclaw acp` process has.
-        let live_config = match &self.config_source {
-            ConfigSource::Live(live_config) if !connection_override_applied => Some(live_config),
-            _ => None,
-        };
-        let Some(store) = self.store.as_ref() else {
-            let execution_capability = match &self.config_source {
-                ConfigSource::Live(live_config) => {
-                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                        live_config.clone(),
-                        self.agent_lifecycle.clone(),
-                    ))
-                }
-                ConfigSource::Standalone(_) => None,
-            };
-            return if let Some(live_config) = live_config {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
+        let execution_capability = match &self.config_source {
+            ConfigSource::Live(live_config) => {
+                Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
                     live_config.clone(),
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                    execution_capability,
-                )
-                .await
-            } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    config,
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                    execution_capability,
-                )
-                .await
-            };
+                    self.agent_lifecycle.clone(),
+                ))
+            }
+            ConfigSource::Standalone(_) => None,
         };
-        if let Some(live_config) = live_config {
-            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                live_config.clone(),
-                self.agent_lifecycle.clone(),
-            );
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-                live_config.clone(),
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                exclude_memory,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-                Some(execution_capability),
-            )
-            .await
-        } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-                config,
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                exclude_memory,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-            )
-            .await
-        }
+        // Use the request's exact route snapshot without re-reading live config
+        // or dropping live policy/admission when a connection override is set.
+        Agent::from_snapshot_with_mcp_backchannel_with_capability(
+            config,
+            agent_alias,
+            Some(workspace_dir),
+            enable_mcp,
+            exclude_memory,
+            // ACP turns transport the typed file attachment `deliver_file` emits.
+            true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
+            self.canvas_store.clone(),
+            self.store.clone(),
+            execution_capability,
+        )
+        .await
     }
 
     /// Set the process- or connection-scoped default agent alias (`--agent`
@@ -475,9 +413,9 @@ impl AcpServer {
     /// on the gateway endpoint). Blank values are treated as absent. The
     /// override applies to `session/new` for the resolved agent only — it
     /// never mutates the live config shared with other connections, and
-    /// restore paths ignore it. Sessions created under an override pin their
-    /// config view for their lifetime (standalone semantics), so a
-    /// live-config refresh cannot silently drop the override mid-session.
+    /// restore paths ignore it. Only the model route generation is pinned;
+    /// managed sessions retain canonical live tool/history policy and execution
+    /// admission even when a connection override is present.
     pub fn with_connection_model_overrides(
         mut self,
         model_provider: Option<String>,
@@ -587,16 +525,15 @@ impl AcpServer {
     }
 
     /// Apply [`Self::connection_model_override`] to an owned snapshot for one
-    /// agent. Returns whether an override was applied, so `build_agent` can
-    /// pin the session to the snapshot (the live constructors re-snapshot
-    /// the shared config and would drop the override).
+    /// agent. The snapshot supplies route construction inputs; it does not
+    /// replace a managed session's canonical live policy authority.
     fn apply_override_to_snapshot(
         &self,
         config: &mut Config,
         agent_alias: &str,
-    ) -> Result<bool, RpcError> {
+    ) -> Result<(), RpcError> {
         match &self.connection_model_override {
-            None => Ok(false),
+            None => Ok(()),
             Some(overrides) => {
                 Self::apply_connection_model_override(config, agent_alias, overrides).map_err(
                     |message| RpcError {
@@ -605,7 +542,7 @@ impl AcpServer {
                         data: None,
                     },
                 )?;
-                Ok(true)
+                Ok(())
             }
         }
     }
@@ -1093,8 +1030,7 @@ impl AcpServer {
         // build, the session record, and the created log line below all see
         // the override. Only `session/new` applies it — restore paths keep
         // the persisted session's provider.
-        let connection_override_applied =
-            self.apply_override_to_snapshot(&mut config, &agent_alias)?;
+        self.apply_override_to_snapshot(&mut config, &agent_alias)?;
         let admission = self
             .agent_lifecycle
             .reserve_admission(agent_alias.clone())
@@ -1176,8 +1112,8 @@ impl AcpServer {
         // Build agent from global config, with the session's cwd pinned as
         // the file/shell sandbox boundary. The agent's data directory
         // (identity, scheduled tasks) still lives under `config.data_dir`.
-        // ACP sessions exclude persistent memory — context comes from the
-        // persisted session history, not the agent's long-term memory store.
+        // Persistent memory is opt-in via `acp_enable_memory`; otherwise
+        // context comes only from the persisted session history.
         // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
         // by default to keep `session/new` prompt; on to load this agent's
         // `mcp_bundles` tools. Runs without the sessions lock held (see above).
@@ -1192,7 +1128,6 @@ impl AcpServer {
                 std::path::Path::new(&workspace_dir),
                 enable_mcp,
                 disable_memory,
-                connection_override_applied,
             )
             .await
         {
@@ -1491,9 +1426,6 @@ impl AcpServer {
                 &workspace_dir,
                 enable_mcp,
                 disable_memory,
-                // Restore paths never apply the connection model override:
-                // transport input cannot rebind persisted session ownership.
-                false,
             )
             .await
             .map_err(|e| RpcError {
@@ -1837,9 +1769,6 @@ impl AcpServer {
                 &workspace_dir,
                 enable_mcp,
                 disable_memory,
-                // Restore paths never apply the connection model override:
-                // transport input cannot rebind persisted session ownership.
-                false,
             )
             .await
             .map_err(|e| RpcError {
@@ -5215,40 +5144,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_new_loads_memory_when_agent_opts_in() {
-        let cwd = tempfile::tempdir().unwrap();
-        let server = start_mock_mcp_http_server("records.list").await;
-        let mut config = make_mcp_granting_test_config(cwd.path(), server.uri());
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent must exist")
-            .acp_enable_memory = true;
-        let acp = AcpServer::new(config, AcpServerConfig::default());
-
-        acp.handle_session_new(&serde_json::json!({
-            "cwd": cwd.path().to_string_lossy(),
-            "agentAlias": "test-agent"
-        }))
-        .await
-        .expect("session/new must succeed");
-
-        let requests = server
-            .received_requests()
-            .await
-            .expect("mock records requests");
-        assert!(
-            requests.iter().any(|r| {
-                let body = std::str::from_utf8(&r.body)
-                    .map(|b| b.contains("tools/list"))
-                    .unwrap_or(false);
-                println!("{:?}", body);
-                body
-            }),
-            "agent with acp_enable_mcp must list tools from granted MCP servers; \
-             got {} request(s)",
-            requests.len()
-        );
+    async fn sessions_honor_memory_opt_in_with_and_without_store() {
+        for managed in [false, true] {
+            for with_store in [false, true] {
+                for enabled in [false, true] {
+                    let cwd = tempfile::tempdir().unwrap();
+                    let mut config = make_test_config(cwd.path());
+                    config.config_path = cwd.path().join("install/config.toml");
+                    config.memory.embedding_provider = "none".into();
+                    config.memory.auto_save = false;
+                    config.memory.min_relevance_score = 0.0;
+                    config
+                        .agents
+                        .get_mut("test-agent")
+                        .unwrap()
+                        .acp_enable_memory = enabled;
+                    let memory =
+                        zeroclaw_memory::create_memory_for_agent(&config, "test-agent", None)
+                            .await
+                            .unwrap();
+                    memory
+                        .store(
+                            "memory-probe",
+                            "memory-probe remembers acp-memory-sentinel",
+                            zeroclaw_memory::MemoryCategory::Core,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+                    let (tx, _rx) = mpsc::channel(64);
+                    let store =
+                        with_store.then(|| Arc::new(AcpSessionStore::new(cwd.path()).unwrap()));
+                    let server = AcpServer::with_writer(
+                        if managed {
+                            ConfigSource::Live(live.handle())
+                        } else {
+                            ConfigSource::Standalone(Box::new(config))
+                        },
+                        Default::default(),
+                        AcpServerConfig::default(),
+                        tx,
+                        None,
+                        store,
+                    );
+                    let created = server
+                        .handle_session_new(&serde_json::json!({}))
+                        .await
+                        .unwrap();
+                    let session_id = created["sessionId"].as_str().unwrap();
+                    for method in ["new", "load", "resume"] {
+                        if method != "new" {
+                            if !with_store {
+                                break;
+                            }
+                            let params = serde_json::json!({"sessionId": session_id});
+                            server.handle_session_close(&params).await.unwrap();
+                            if method == "load" {
+                                server.handle_session_load(&params).await.unwrap();
+                            } else {
+                                server.handle_session_resume(&params).await.unwrap();
+                            }
+                        }
+                        let session = server.sessions.lock().await[session_id].clone();
+                        let mut session = session.lock().await;
+                        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                        session
+                            .agent
+                            .set_model_provider(Box::new(RecordingNativeProvider {
+                                requests: Arc::clone(&requests),
+                            }));
+                        session.agent.turn("memory-probe").await.unwrap();
+                        let requests = requests.lock();
+                        assert!(!requests.is_empty(), "must reach the provider boundary");
+                        assert_eq!(
+                            requests
+                                .iter()
+                                .flatten()
+                                .any(|m| m.content.contains("acp-memory-sentinel")),
+                            enabled,
+                            "memory opt-in: managed={managed}, store={with_store}, method={method}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -5616,32 +5596,270 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_config_session_new_applies_connection_model_override() {
-        let cwd = tempfile::tempdir().unwrap();
-        // Gateway connections resolve through a live config handle; the
-        // override must survive that path (the session pins the overridden
-        // snapshot instead of re-snapshotting the live config).
-        let live = zeroclaw_config::live::LiveConfig::new(make_test_config(cwd.path()));
-        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
-        let server = AcpServer::new_with_live_config_and_writer(
-            live.handle(),
-            Default::default(),
-            AcpServerConfig::default(),
-            writer_tx,
-        )
-        .with_connection_model_overrides(None, Some("claude-sonnet-4-6".to_string()));
+    async fn live_config_sessions_keep_overrides_and_follow_history_policy() {
+        for with_store in [false, true] {
+            for provider_override in [None, Some("anthropic.fast")] {
+                let cwd = tempfile::tempdir().unwrap();
+                let mut config = make_test_config(cwd.path());
+                config.config_path = cwd.path().join("install/config.toml");
+                config
+                    .runtime_profiles
+                    .get_mut("default")
+                    .unwrap()
+                    .max_history_messages = Some(8);
+                let live = zeroclaw_config::live::LiveConfig::new(config);
+                let (writer_tx, _writer_rx) = mpsc::channel(64);
+                let server = if with_store {
+                    AcpServer::new_with_live_config_and_writer_and_store(
+                        live.handle(),
+                        Default::default(),
+                        AcpServerConfig::default(),
+                        writer_tx,
+                        Arc::new(AcpSessionStore::new(cwd.path()).unwrap()),
+                    )
+                } else {
+                    AcpServer::new_with_live_config_and_writer(
+                        live.handle(),
+                        Default::default(),
+                        AcpServerConfig::default(),
+                        writer_tx,
+                    )
+                }
+                .with_connection_model_overrides(
+                    provider_override.map(str::to_string),
+                    Some("claude-sonnet-4-6".to_string()),
+                );
+                let created = server
+                    .handle_session_new(&serde_json::json!({}))
+                    .await
+                    .unwrap();
+                let session_id = created["sessionId"].as_str().unwrap();
+                for method in ["new", "load", "resume"] {
+                    // Each restored agent starts against the current canonical
+                    // route, not the connection's session/new-only override.
+                    let mut current = live.snapshot();
+                    current
+                        .runtime_profiles
+                        .get_mut("default")
+                        .unwrap()
+                        .max_history_messages = Some(8);
+                    live.publish(live.next_revision().unwrap(), current)
+                        .unwrap();
+                    if method != "new" {
+                        if !with_store {
+                            break;
+                        }
+                        let params = serde_json::json!({"sessionId": session_id});
+                        server.handle_session_close(&params).await.unwrap();
+                        if method == "load" {
+                            server.handle_session_load(&params).await.unwrap();
+                        } else {
+                            server.handle_session_resume(&params).await.unwrap();
+                        }
+                    }
+                    let session = server.sessions.lock().await[session_id].clone();
+                    let mut session = session.lock().await;
+                    let expected_route = if method == "new" {
+                        (
+                            provider_override.unwrap_or("anthropic.default"),
+                            "claude-sonnet-4-6",
+                        )
+                    } else {
+                        ("anthropic.default", "reloaded-model")
+                    };
+                    let (_, provider, model) = session.agent.attribution_fields();
+                    assert_eq!((provider.as_str(), model.as_str()), expected_route);
+                    assert_eq!(session.model_provider, provider);
+                    assert_eq!(session.model, model);
+                    let history = vec![
+                        ChatMessage::user("old request"),
+                        ChatMessage::assistant("old answer"),
+                        ChatMessage::user("new request"),
+                        ChatMessage::assistant("new answer"),
+                    ];
+                    assert!(session.agent.seed_history_with_event(&history).is_none());
+                    session.agent.clear_history();
 
-        let result = server
-            .handle_session_new(&serde_json::json!({
-                "cwd": cwd.path().to_string_lossy(),
-                "mcpServers": []
-            }))
-            .await
-            .expect("session/new on a live-config server should honor the override");
+                    let mut reloaded = live.snapshot();
+                    // Neither the provider ref nor its model was published by
+                    // applying this connection's override.
+                    assert_eq!(
+                        reloaded.agents["test-agent"].model_provider.as_str(),
+                        "anthropic.default"
+                    );
+                    assert!(!reloaded.providers.models.anthropic.contains_key("fast"));
+                    assert_eq!(
+                        reloaded.providers.models.anthropic["default"]
+                            .base
+                            .model
+                            .as_deref(),
+                        Some(if method == "new" {
+                            "claude-haiku-4-5"
+                        } else {
+                            "reloaded-model"
+                        })
+                    );
+                    reloaded
+                        .runtime_profiles
+                        .get_mut("default")
+                        .unwrap()
+                        .max_history_messages = Some(1);
+                    reloaded
+                        .providers
+                        .models
+                        .anthropic
+                        .get_mut("default")
+                        .unwrap()
+                        .base
+                        .model = Some("reloaded-model".into());
+                    live.publish(live.next_revision().unwrap(), reloaded)
+                        .unwrap();
 
-        let session_id = result["sessionId"].as_str().unwrap();
-        let (_, model) = session_model(&server, session_id).await;
-        assert_eq!(model, "claude-sonnet-4-6");
+                    session.agent.sync_config_generation();
+                    let (_, provider, model) = session.agent.attribution_fields();
+                    assert_eq!((provider.as_str(), model.as_str()), expected_route);
+                    assert!(
+                        session.agent.seed_history_with_event(&history).is_some(),
+                        "canonical live history policy must trim: store={with_store}, method={method}"
+                    );
+                    assert!(!session.agent.history().iter().any(|m| {
+                        matches!(m, ConversationMessage::Chat(m) if m.content == "old request")
+                    }));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_config_override_sessions_retain_execution_admission() {
+        struct DelegateProbeProvider(std::sync::atomic::AtomicBool);
+
+        impl zeroclaw_api::attribution::Attributable for DelegateProbeProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "DelegateProbeProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for DelegateProbeProvider {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..Default::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("probe must use native tool calling")
+            }
+
+            async fn chat(
+                &self,
+                request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                let first = !self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow::ensure!(
+                    request
+                        .tools
+                        .is_some_and(|tools| tools.iter().any(|tool| tool.name == "delegate")),
+                    "delegate must be offered to exercise execution admission"
+                );
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: (!first).then(|| "Admission checked.".to_string()),
+                    tool_calls: if first {
+                        vec![ToolCall {
+                            id: "admission-probe".into(),
+                            name: "delegate".into(),
+                            arguments: serde_json::json!({"agent": "worker", "prompt": "probe"})
+                                .to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        for with_store in [false, true] {
+            let cwd = tempfile::tempdir().unwrap();
+            let mut config = make_test_config(cwd.path());
+            config.config_path = cwd.path().join("install/config.toml");
+            config.tools.optional = vec!["delegate".into()];
+            let risk = config.risk_profiles.get_mut("default").unwrap();
+            risk.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+            risk.delegation_policy.mode = zeroclaw_config::autonomy::DelegationMode::Allow;
+            // An unconstructable target guarantees a missing-capability
+            // regression cannot accidentally contact an external provider.
+            config
+                .agents
+                .insert("worker".into(), dispatchable_test_agent("missing.target"));
+            let live = zeroclaw_config::live::LiveConfig::new(config);
+            let lifecycle =
+                zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+            let (tx, _rx) = mpsc::channel(64);
+            let server = AcpServer::with_writer(
+                ConfigSource::Live(live.handle()),
+                lifecycle.clone(),
+                AcpServerConfig::default(),
+                tx,
+                None,
+                with_store.then(|| Arc::new(AcpSessionStore::new(cwd.path()).unwrap())),
+            )
+            .with_connection_model_overrides(None, Some("claude-sonnet-4-6".into()));
+            let created = server
+                .handle_session_new(&serde_json::json!({"agentAlias": "test-agent"}))
+                .await
+                .unwrap();
+            let session_id = created["sessionId"].as_str().unwrap();
+            for method in ["new", "load", "resume"] {
+                if method != "new" {
+                    if !with_store {
+                        break;
+                    }
+                    let params = serde_json::json!({"sessionId": session_id});
+                    server.handle_session_close(&params).await.unwrap();
+                    if method == "load" {
+                        server.handle_session_load(&params).await.unwrap();
+                    } else {
+                        server.handle_session_resume(&params).await.unwrap();
+                    }
+                }
+                let _deletion = lifecycle.begin_delete("worker").unwrap();
+                let session = server.sessions.lock().await[session_id].clone();
+                let mut session = session.lock().await;
+                session
+                    .agent
+                    .set_model_provider(Box::new(DelegateProbeProvider(false.into())));
+                session.agent.turn("Check worker admission.").await.unwrap();
+                assert!(
+                    session.agent.history().iter().any(|message| {
+                        matches!(message, ConversationMessage::ToolResults(results)
+                        if results.iter().any(|result| result.tool_call_id == "admission-probe"
+                            && result.content.contains("agent `worker` is being deleted")))
+                    }),
+                    "delegate must use the canonical lifecycle: store={with_store}, method={method}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
